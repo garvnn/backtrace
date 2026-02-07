@@ -30,6 +30,7 @@ def load_data(ticker, start_date, end_date):
     if os.path.exists(cache_file):
         print(f"Loading {ticker} from cache...")
         data = pd.read_csv(cache_file, index_col=0, parse_dates=True)
+        data = data.apply(pd.to_numeric, errors='coerce')
     else:
         print(f"Downloading {ticker} from Yahoo Finance...")
         data = yf.download(ticker, start=start_date, end=end_date, progress=False)
