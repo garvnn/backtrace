@@ -44,7 +44,55 @@ class BacktestEngine:
             'total_return': total_return,
             'trades': 1  # Just the initial buy
         }
-
+    
+    def run(self, data, strategy):
+        """
+        Run backtest with a strategy.
+        
+        Args:
+            data: DataFrame with price data
+            strategy: Strategy object
+            
+        Returns:
+            Dict with results
+        """
+        signals = strategy.generate_signals(data)
+        
+        # Start with cash
+        cash = self.initial_capital
+        shares = 0
+        portfolio_values = []
+        trades = 0
+        
+        for i in range(len(data)):
+            price = float(data['Close'].iloc[i])
+            signal = signals.iloc[i]
+            
+            # Execute trades based on signal
+            if signal == 1 and shares == 0:  # Buy signal
+                shares = cash / price
+                cost = cash * self.commission
+                cash = 0
+                trades += 1
+            elif signal == 0 and shares > 0:  # Sell signal
+                cash = shares * price
+                cost = cash * self.commission
+                cash -= cost
+                shares = 0
+                trades += 1
+            
+            # Calculate portfolio value
+            portfolio_value = cash + (shares * price)
+            portfolio_values.append(portfolio_value)
+        
+        portfolio_values = pd.Series(portfolio_values, index=data.index)
+        total_return = (portfolio_values.iloc[-1] / self.initial_capital) - 1
+        
+        return {
+            'portfolio_values': portfolio_values,
+            'total_return': total_return,
+            'trades': trades
+        }
 
 if __name__ == "__main__":
     # Test the engine
@@ -59,3 +107,13 @@ if __name__ == "__main__":
     print(f"\nInitial Capital: ${engine.initial_capital:,.2f}")
     print(f"Final Value: ${float(results['portfolio_values'].iloc[-1]):,.2f}")
     print(f"Total Return: {results['total_return']:.2%}")
+
+# Test with strategy
+    from strategies.mean_reversion import MeanReversionStrategy
+    
+    strategy = MeanReversionStrategy()
+    results_strategy = engine.run(data, strategy)
+    
+    print(f"\n--- Strategy Results ---")
+    print(f"Total Return: {results_strategy['total_return']:.2%}")
+    print(f"Number of Trades: {results_strategy['trades']}")

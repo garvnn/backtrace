@@ -29,15 +29,20 @@ def load_data(ticker, start_date, end_date):
     
     if os.path.exists(cache_file):
         print(f"Loading {ticker} from cache...")
-        data = pd.read_csv(cache_file, index_col=0, parse_dates=True)
-        data = data.apply(pd.to_numeric, errors='coerce')
+        df = pd.read_csv(cache_file, index_col=0, parse_dates=True)
+        df = df.apply(pd.to_numeric, errors='coerce')
     else:
         print(f"Downloading {ticker} from Yahoo Finance...")
-        data = yf.download(ticker, start=start_date, end=end_date, progress=False)
-        data.to_csv(cache_file)
+        df = yf.download(ticker, start=start_date, end=end_date, progress=False)
+
+        # Flatten multi-index columns if they exist
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+
+        df.to_csv(cache_file)
         print(f"Saved to cache: {cache_file}")
     
-    return data
+    return df
 
 
 if __name__ == "__main__":
