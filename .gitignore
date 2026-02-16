@@ -23,3 +23,7 @@ results/
 # OS
 .DS_Store
 EOF
+
+.env
+live/.env
+*.db
