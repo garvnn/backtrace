@@ -19,6 +19,8 @@ import pandas as pd
 from strategies.momentum import MomentumStrategy
 from strategies.mean_reversion import MeanReversionStrategy
 
+from database import Database
+
 load_dotenv()
 
 class StrategyExecutor:
@@ -37,6 +39,7 @@ class StrategyExecutor:
             os.getenv('ALPACA_API_KEY'),
             os.getenv('ALPACA_SECRET_KEY')
         )
+        self.db = Database()
     
     def get_historical_data(self, days=300):
         """Get historical price data from Alpaca."""
@@ -99,7 +102,7 @@ class StrategyExecutor:
         if signal == 1 and current_position == 0:
             # Buy with all available cash
             current_price = float(data['Close'].iloc[-1])
-            qty = int(buying_power * 0.95 / current_price)  # Use 95% of buying power
+            qty = int(buying_power * 0.95 / current_price)
             
             if qty > 0:
                 order_data = MarketOrderRequest(
@@ -110,6 +113,18 @@ class StrategyExecutor:
                 )
                 order = self.trading_client.submit_order(order_data)
                 print(f"BUY order placed: {qty} shares")
+                
+                # Log to database
+                self.db.log_trade(
+                    strategy=self.strategy.name,
+                    ticker=self.ticker,
+                    side='BUY',
+                    qty=qty,
+                    price=current_price,
+                    order_id=str(order.id),
+                    status=str(order.status)
+                )
+                
                 return order
         
         elif signal == 0 and current_position > 0:
@@ -122,6 +137,17 @@ class StrategyExecutor:
             )
             order = self.trading_client.submit_order(order_data)
             print(f"SELL order placed: {current_position} shares")
+            
+            # Log to database
+            self.db.log_trade(
+                strategy=self.strategy.name,
+                ticker=self.ticker,
+                side='SELL',
+                qty=current_position,
+                order_id=str(order.id),
+                status=str(order.status)
+            )
+            
             return order
         
         else:
@@ -149,6 +175,19 @@ class StrategyExecutor:
         self.execute_signal(current_signal, data)
         
         print("="*60)
+
+        print("="*60)
+        
+        # Log portfolio snapshot
+        account = self.trading_client.get_account()
+        positions = {pos.symbol: float(pos.qty) for pos in self.trading_client.get_all_positions()}
+        
+        self.db.log_portfolio_snapshot(
+            strategy=self.strategy.name,
+            portfolio_value=float(account.portfolio_value),
+            cash=float(account.cash),
+            positions=positions
+        )
 
 
 if __name__ == "__main__":
