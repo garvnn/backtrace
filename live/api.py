@@ -4,10 +4,12 @@ FastAPI backend for live trading dashboard.
 
 import sys
 import os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, PROJECT_ROOT)
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from database import Database
 import json
 
@@ -114,6 +116,61 @@ def get_performance(strategy: str = None):
         "current_value": current_value,
         "initial_value": initial_value
     }
+
+
+class BacktestRequest(BaseModel):
+    ticker: str
+    start_date: str = "2020-01-01"
+    end_date: str = "2024-12-31"
+    strategy: str = "Momentum"
+
+
+@app.post("/backtest")
+def run_backtest(req: BacktestRequest):
+    """Run backtest for a ticker and save results. Returns the saved run."""
+    ticker = req.ticker.strip().upper()
+    if not ticker:
+        raise HTTPException(status_code=400, detail="ticker is required")
+    start_date = req.start_date
+    end_date = req.end_date
+    strategy_name = req.strategy or "Momentum"
+    old_cwd = os.getcwd()
+    try:
+        os.chdir(PROJECT_ROOT)
+        from data.loader import load_data
+        from engine.backtest_engine import BacktestEngine
+        from strategies.momentum import MomentumStrategy
+        from strategies.mean_reversion import MeanReversionStrategy
+        from analytics.metrics import calculate_metrics
+        data = load_data(ticker, start_date, end_date)
+        if data is None or len(data) == 0:
+            raise HTTPException(status_code=422, detail=f"No data for {ticker} in range {start_date} to {end_date}")
+        strategy_map = {"Momentum": MomentumStrategy(), "MeanReversion": MeanReversionStrategy()}
+        strategy = strategy_map.get(strategy_name) or strategy_map["Momentum"]
+        engine = BacktestEngine()
+        results = engine.run(data, strategy)
+        metrics = calculate_metrics(results)
+        db.save_backtest_results(
+            strategy_name, ticker, start_date, end_date,
+            float(metrics["total_return"]), float(metrics["sharpe_ratio"]),
+            float(metrics["max_drawdown"]), int(metrics["num_trades"]),
+            results["portfolio_values"],
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        os.chdir(old_cwd)
+    saved = db.get_backtest_results(ticker=ticker, strategy=strategy_name)
+    return saved[0] if saved else {}
+
+
+@app.get("/backtest-results")
+def get_backtest_results(ticker: str = None, strategy: str = None):
+    """Get saved backtest results, optionally filtered by ticker and/or strategy."""
+    results = db.get_backtest_results(ticker=ticker, strategy=strategy)
+    return {"results": results}
 
 
 if __name__ == "__main__":

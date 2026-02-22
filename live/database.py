@@ -137,6 +137,56 @@ class Database:
         conn.close()
         return history
 
+    def get_backtest_results(self, ticker=None, strategy=None):
+        """Get saved backtest results, optionally filtered by ticker and/or strategy."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        query = 'SELECT id, strategy, ticker, start_date, end_date, total_return, sharpe_ratio, max_drawdown, num_trades, equity_curve FROM backtest_results'
+        params = []
+        clauses = []
+        if ticker:
+            clauses.append('ticker = ?')
+            params.append(ticker)
+        if strategy:
+            clauses.append('strategy = ?')
+            params.append(strategy)
+        if clauses:
+            query += ' WHERE ' + ' AND '.join(clauses)
+        query += ' ORDER BY id DESC'
+        cursor.execute(query, params)
+        rows = cursor.fetchall()
+        conn.close()
+        out = []
+        for row in rows:
+            ec_raw = row[9]
+            equity_curve = []
+            if ec_raw:
+                try:
+                    ec_dict = json.loads(ec_raw)
+                    for ts, val in ec_dict.items():
+                        try:
+                            ts_val = int(ts)
+                            ts_str = datetime.utcfromtimestamp(ts_val / 1000.0).strftime("%Y-%m-%d")
+                        except (ValueError, TypeError):
+                            ts_str = str(ts)
+                        equity_curve.append({"timestamp": ts_str, "portfolio_value": float(val)})
+                    equity_curve.sort(key=lambda x: x["timestamp"])
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            out.append({
+                "id": row[0],
+                "strategy": row[1],
+                "ticker": row[2],
+                "start_date": row[3],
+                "end_date": row[4],
+                "total_return": row[5],
+                "sharpe_ratio": row[6],
+                "max_drawdown": row[7],
+                "num_trades": row[8],
+                "equity_curve": equity_curve,
+            })
+        return out
+
 
 if __name__ == "__main__":
     # Test the database
