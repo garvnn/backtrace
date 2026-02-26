@@ -1,6 +1,6 @@
 # BackTrace
 
-A Python-based quantitative backtesting engine that demonstrates why most retail trading strategies underperform passive investing.
+A Python-based quantitative backtesting engine that demonstrates why most retail trading strategies underperform passive investing. The **live** module adds paper trading (Alpaca) and a dashboard to compare backtest vs live performance.
 
 ## Overview
 
