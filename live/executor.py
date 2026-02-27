@@ -21,24 +21,25 @@ from strategies.mean_reversion import MeanReversionStrategy
 
 from database import Database
 
-load_dotenv()
+# Load .env from live/ so it works when run as "python live/executor.py" from project root
+_env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+load_dotenv(_env_path)
 
 class StrategyExecutor:
     def __init__(self, strategy, ticker='AAPL'):
         self.strategy = strategy
         self.ticker = ticker
+        api_key = os.getenv('ALPACA_API_KEY')
+        secret_key = os.getenv('ALPACA_SECRET_KEY')
+        if not api_key or not secret_key:
+            raise ValueError(
+                "Missing Alpaca keys. Create live/.env with ALPACA_API_KEY and ALPACA_SECRET_KEY "
+                "(get paper keys at https://app.alpaca.markets/paper/dashboard/apis)."
+            )
+        # Alpaca clients (paper=True for paper trading)
+        self.trading_client = TradingClient(api_key, secret_key, paper=True)
         
-        # Alpaca clients
-        self.trading_client = TradingClient(
-            os.getenv('ALPACA_API_KEY'),
-            os.getenv('ALPACA_SECRET_KEY'),
-            paper=True
-        )
-        
-        self.data_client = StockHistoricalDataClient(
-            os.getenv('ALPACA_API_KEY'),
-            os.getenv('ALPACA_SECRET_KEY')
-        )
+        self.data_client = StockHistoricalDataClient(api_key, secret_key)
         self.db = Database()
     
     def get_historical_data(self, days=300):

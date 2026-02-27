@@ -31,11 +31,45 @@ header p {
   color: #94a3b8;
 }
 
+.strategy-controls {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem 1rem;
+  margin-top: 1rem;
+  flex-wrap: wrap;
+  justify-content: center;
+}
+
+.strategy-label,
+.param-label {
+  color: #94a3b8;
+  font-size: 0.9rem;
+}
+
+.strategy-select {
+  padding: 0.4rem 0.6rem;
+  border-radius: 6px;
+  border: 1px solid #334155;
+  background: #0f172a;
+  color: #f1f5f9;
+  font-size: 0.95rem;
+}
+
+.param-input {
+  width: 4rem;
+  padding: 0.4rem;
+  border-radius: 6px;
+  border: 1px solid #334155;
+  background: #0f172a;
+  color: #f1f5f9;
+  font-size: 0.9rem;
+}
+
 .ticker-load {
   display: flex;
   align-items: center;
   gap: 0.75rem;
-  margin-top: 1rem;
+  margin-top: 0.75rem;
   flex-wrap: wrap;
   justify-content: center;
 }
@@ -80,6 +114,26 @@ header p {
   font-size: 0.9rem;
 }
 
+.run-executor-btn {
+  padding: 0.5rem 1rem;
+  border-radius: 8px;
+  border: none;
+  background: #22c55e;
+  color: #fff;
+  font-weight: 600;
+  cursor: pointer;
+  font-size: 0.95rem;
+}
+
+.run-executor-btn:hover:not(:disabled) {
+  background: #16a34a;
+}
+
+.run-executor-btn:disabled {
+  opacity: 0.7;
+  cursor: not-allowed;
+}
+
 .comparison-card .comparison-stats {
   display: flex;
   flex-direction: column;
@@ -102,6 +156,25 @@ header p {
   margin-top: 1rem;
   color: #94a3b8;
   font-size: 0.875rem;
+}
+
+.strategy-help .help-content {
+  color: #cbd5e1;
+  font-size: 0.95rem;
+  line-height: 1.5;
+}
+
+.strategy-help .help-content p {
+  margin-bottom: 0.75rem;
+}
+
+.strategy-help .help-content p:last-child {
+  margin-bottom: 0;
+}
+
+.params-used .params-text {
+  font-size: 0.9rem;
+  font-weight: 500;
 }
 
 .container {

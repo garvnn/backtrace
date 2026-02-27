@@ -4,8 +4,10 @@ FastAPI backend for live trading dashboard.
 
 import sys
 import os
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+LIVE_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(LIVE_DIR)
 sys.path.insert(0, PROJECT_ROOT)
+sys.path.insert(0, LIVE_DIR)
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -24,7 +26,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-db = Database()
+db = Database(os.path.join(LIVE_DIR, "trading.db"))
 
 
 @app.get("/")
@@ -123,6 +125,17 @@ class BacktestRequest(BaseModel):
     start_date: str = "2020-01-01"
     end_date: str = "2024-12-31"
     strategy: str = "Momentum"
+    short_window: int = 50
+    long_window: int = 200
+    lookback_period: int = 120
+
+
+def _build_strategy(strategy_name: str, short_window: int, long_window: int, lookback_period: int):
+    from strategies.momentum import MomentumStrategy
+    from strategies.mean_reversion import MeanReversionStrategy
+    if strategy_name == "MeanReversion" or strategy_name == "MA Crossover":
+        return MeanReversionStrategy(short_window=short_window, long_window=long_window)
+    return MomentumStrategy(lookback_period=lookback_period)
 
 
 @app.post("/backtest")
@@ -134,19 +147,18 @@ def run_backtest(req: BacktestRequest):
     start_date = req.start_date
     end_date = req.end_date
     strategy_name = req.strategy or "Momentum"
+    if strategy_name == "MA Crossover":
+        strategy_name = "MeanReversion"
     old_cwd = os.getcwd()
     try:
         os.chdir(PROJECT_ROOT)
         from data.loader import load_data
         from engine.backtest_engine import BacktestEngine
-        from strategies.momentum import MomentumStrategy
-        from strategies.mean_reversion import MeanReversionStrategy
         from analytics.metrics import calculate_metrics
         data = load_data(ticker, start_date, end_date)
         if data is None or len(data) == 0:
             raise HTTPException(status_code=422, detail=f"No data for {ticker} in range {start_date} to {end_date}")
-        strategy_map = {"Momentum": MomentumStrategy(), "MeanReversion": MeanReversionStrategy()}
-        strategy = strategy_map.get(strategy_name) or strategy_map["Momentum"]
+        strategy = _build_strategy(strategy_name, req.short_window, req.long_window, req.lookback_period)
         engine = BacktestEngine()
         results = engine.run(data, strategy)
         metrics = calculate_metrics(results)
@@ -163,7 +175,14 @@ def run_backtest(req: BacktestRequest):
     finally:
         os.chdir(old_cwd)
     saved = db.get_backtest_results(ticker=ticker, strategy=strategy_name)
-    return saved[0] if saved else {}
+    result = saved[0] if saved else {}
+    result["params_used"] = {
+        "strategy": strategy_name,
+        "short_window": req.short_window,
+        "long_window": req.long_window,
+        "lookback_period": req.lookback_period,
+    }
+    return result
 
 
 @app.get("/backtest-results")
@@ -171,6 +190,47 @@ def get_backtest_results(ticker: str = None, strategy: str = None):
     """Get saved backtest results, optionally filtered by ticker and/or strategy."""
     results = db.get_backtest_results(ticker=ticker, strategy=strategy)
     return {"results": results}
+
+
+class RunExecutorRequest(BaseModel):
+    strategy: str = "Momentum"
+    ticker: str = "AAPL"
+    short_window: int = 50
+    long_window: int = 200
+    lookback_period: int = 120
+
+
+@app.post("/run-executor")
+def run_executor(req: RunExecutorRequest = None):
+    """Run the strategy executor once (paper trade) with selected strategy and params."""
+    req = req or RunExecutorRequest()
+    ticker = (req.ticker or "AAPL").strip().upper()
+    strategy_name = req.strategy or "Momentum"
+    if strategy_name == "MA Crossover":
+        strategy_name = "MeanReversion"
+    old_cwd = os.getcwd()
+    try:
+        os.chdir(LIVE_DIR)
+        from executor import StrategyExecutor
+        strategy = _build_strategy(strategy_name, req.short_window, req.long_window, req.lookback_period)
+        executor = StrategyExecutor(strategy, ticker=ticker)
+        executor.run()
+        return {
+            "ok": True,
+            "message": "Strategy run complete. Check portfolio and trades.",
+            "params_used": {
+                "strategy": strategy_name,
+                "short_window": req.short_window,
+                "long_window": req.long_window,
+                "lookback_period": req.lookback_period,
+            },
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        os.chdir(old_cwd)
 
 
 if __name__ == "__main__":

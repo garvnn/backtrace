@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
 import './App.css';
 
@@ -15,6 +15,15 @@ function App() {
   const [backtestResult, setBacktestResult] = useState(null);
   const [backtestLoading, setBacktestLoading] = useState(false);
   const [backtestError, setBacktestError] = useState(null);
+  const [executorLoading, setExecutorLoading] = useState(false);
+  const [executorError, setExecutorError] = useState(null);
+  const [strategySelect, setStrategySelect] = useState('Momentum');
+  const [shortMa, setShortMa] = useState(50);
+  const [longMa, setLongMa] = useState(200);
+  const [lookbackPeriod, setLookbackPeriod] = useState(120);
+  const shortMaRef = useRef(null);
+  const longMaRef = useRef(null);
+  const lookbackRef = useRef(null);
 
   useEffect(() => {
     fetchData();
@@ -65,22 +74,73 @@ function App() {
     return (value * 100).toFixed(2) + '%';
   };
 
+  const runExecutor = async () => {
+    setExecutorError(null);
+    setExecutorLoading(true);
+    const sw = shortMaRef.current ? Number(shortMaRef.current.value) : shortMa;
+    const lw = longMaRef.current ? Number(longMaRef.current.value) : longMa;
+    const lb = lookbackRef.current ? Number(lookbackRef.current.value) : lookbackPeriod;
+    try {
+      const body = {
+        strategy: strategySelect,
+        ticker: tickerInput.trim().toUpperCase() || 'AAPL',
+        short_window: sw || 50,
+        long_window: lw || 200,
+        lookback_period: lb || 120,
+      };
+      const res = await fetch(`${API_BASE}/run-executor`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || 'Run failed');
+      await fetchData();
+    } catch (err) {
+      setExecutorError(err.message);
+    } finally {
+      setExecutorLoading(false);
+    }
+  };
+
   const loadBacktest = async () => {
     const ticker = tickerInput.trim().toUpperCase();
     if (!ticker) return;
     setBacktestError(null);
     setBacktestLoading(true);
+    const sw = shortMaRef.current ? Number(shortMaRef.current.value) : shortMa;
+    const lw = longMaRef.current ? Number(longMaRef.current.value) : longMa;
+    const lb = lookbackRef.current ? Number(lookbackRef.current.value) : lookbackPeriod;
     try {
+      const body = {
+        ticker,
+        start_date: '2020-01-01',
+        end_date: '2024-12-31',
+        strategy: strategySelect,
+        short_window: sw || 50,
+        long_window: lw || 200,
+        lookback_period: lb || 120,
+      };
       const res = await fetch(`${API_BASE}/backtest`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ticker, start_date: '2020-01-01', end_date: '2024-12-31', strategy: 'Momentum' }),
+        body: JSON.stringify(body),
       });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.detail || 'Backtest failed');
-      setBacktestResult(data);
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const msg = Array.isArray(data.detail)
+          ? (data.detail[0]?.msg || JSON.stringify(data.detail))
+          : (typeof data.detail === 'string' ? data.detail : data.detail || 'Backtest failed');
+        throw new Error(msg);
+      }
+      if (data && (data.equity_curve !== undefined || data.total_return !== undefined)) {
+        setBacktestResult(data);
+      } else {
+        setBacktestResult(null);
+        setBacktestError('Backtest returned no data.');
+      }
     } catch (err) {
-      setBacktestError(err.message);
+      setBacktestError(err.message || 'Backtest failed');
       setBacktestResult(null);
     } finally {
       setBacktestLoading(false);
@@ -111,6 +171,56 @@ function App() {
       <header>
         <h1>BackTrace Live</h1>
         <p>Backtest vs Reality</p>
+        <div className="strategy-controls">
+          <label className="strategy-label">Strategy</label>
+          <select
+            value={strategySelect}
+            onChange={(e) => setStrategySelect(e.target.value)}
+            className="strategy-select"
+            disabled={backtestLoading || executorLoading}
+          >
+            <option value="Momentum">Momentum</option>
+            <option value="MA Crossover">MA Crossover</option>
+          </select>
+          {strategySelect === 'MA Crossover' && (
+            <>
+              <label className="param-label">Short MA (days)</label>
+              <input
+                ref={shortMaRef}
+                type="number"
+                min={1}
+                max={500}
+                value={shortMa}
+                onChange={(e) => setShortMa(Number(e.target.value) || 50)}
+                className="param-input"
+              />
+              <label className="param-label">Long MA (days)</label>
+              <input
+                ref={longMaRef}
+                type="number"
+                min={1}
+                max={500}
+                value={longMa}
+                onChange={(e) => setLongMa(Number(e.target.value) || 200)}
+                className="param-input"
+              />
+            </>
+          )}
+          {strategySelect === 'Momentum' && (
+            <>
+              <label className="param-label">Lookback (days)</label>
+              <input
+                ref={lookbackRef}
+                type="number"
+                min={1}
+                max={500}
+                value={lookbackPeriod}
+                onChange={(e) => setLookbackPeriod(Number(e.target.value) || 120)}
+                className="param-input"
+              />
+            </>
+          )}
+        </div>
         <div className="ticker-load">
           <input
             type="text"
@@ -124,6 +234,10 @@ function App() {
             {backtestLoading ? 'Running…' : 'Load backtest'}
           </button>
           {backtestError && <span className="backtest-error">{backtestError}</span>}
+          <button type="button" onClick={runExecutor} disabled={executorLoading} className="run-executor-btn">
+            {executorLoading ? 'Running…' : 'Run strategy now'}
+          </button>
+          {executorError && <span className="backtest-error">{executorError}</span>}
         </div>
       </header>
 
@@ -134,6 +248,23 @@ function App() {
       )}
 
       <div className="container">
+        <div className="card strategy-help chart-card">
+          <h2>How the strategies work</h2>
+          {strategySelect === 'MA Crossover' ? (
+            <div className="help-content">
+              <p><strong>MA Crossover (moving average crossover)</strong></p>
+              <p><strong>Short MA</strong> and <strong>Long MA</strong> are the number of trading days used to compute two moving averages of the stock&apos;s closing price. The short MA reacts faster to recent prices; the long MA is smoother.</p>
+              <p><strong>Buy:</strong> when the short MA crosses above the long MA (short &gt; long). That often means recent momentum is turning up. <strong>Sell:</strong> when the short MA crosses below the long MA (short &lt; long).</p>
+              <p>Example: 50/200 means buy when the 50-day average is above the 200-day average. Smaller short (e.g. 20) gives more frequent signals; larger short (e.g. 100) gives fewer, slower signals.</p>
+            </div>
+          ) : (
+            <div className="help-content">
+              <p><strong>Momentum</strong></p>
+              <p>The strategy looks at the stock&apos;s <strong>total return over the last N days</strong> (the lookback). If that return is positive, it goes long; if negative, it goes to cash.</p>
+              <p><strong>Lookback (days)</strong> is that N: e.g. 120 ≈ 6 months of trading days. Shorter lookback (e.g. 30) reacts faster to recent performance but can whipsaw. Longer lookback (e.g. 252 ≈ 1 year) trades less often and follows longer-term trend.</p>
+            </div>
+          )}
+        </div>
         {/* Portfolio Summary */}
         <div className="card">
           <h2>Current Portfolio</h2>
@@ -195,25 +326,35 @@ function App() {
         {/* Backtest Results */}
         <div className="card">
           <h2>Backtest Results {backtestResult?.ticker && `(${backtestResult.ticker})`}</h2>
-          {backtestResult ? (
+          {backtestResult && (backtestResult.total_return !== undefined || backtestResult.equity_curve) ? (
             <div className="stats">
+              {backtestResult.params_used && (
+                <div className="stat params-used">
+                  <span className="label">Params used</span>
+                  <span className="value params-text">
+                    {backtestResult.params_used.strategy === 'MeanReversion'
+                      ? `Short MA ${backtestResult.params_used.short_window}, Long MA ${backtestResult.params_used.long_window}`
+                      : `Lookback ${backtestResult.params_used.lookback_period} days`}
+                  </span>
+                </div>
+              )}
               <div className="stat">
                 <span className="label">Total Return</span>
-                <span className={`value ${backtestResult.total_return >= 0 ? 'positive' : 'negative'}`}>
-                  {formatPercent(backtestResult.total_return)}
+                <span className={`value ${(backtestResult.total_return ?? 0) >= 0 ? 'positive' : 'negative'}`}>
+                  {formatPercent(backtestResult.total_return ?? 0)}
                 </span>
               </div>
               <div className="stat">
                 <span className="label">Sharpe Ratio</span>
-                <span className="value">{Number(backtestResult.sharpe_ratio).toFixed(2)}</span>
+                <span className="value">{Number(backtestResult.sharpe_ratio ?? 0).toFixed(2)}</span>
               </div>
               <div className="stat">
                 <span className="label">Max Drawdown</span>
-                <span className="value negative">{formatPercent(backtestResult.max_drawdown)}</span>
+                <span className="value negative">{formatPercent(backtestResult.max_drawdown ?? 0)}</span>
               </div>
               <div className="stat">
                 <span className="label">Number of Trades</span>
-                <span className="value">{backtestResult.num_trades}</span>
+                <span className="value">{backtestResult.num_trades ?? 0}</span>
               </div>
             </div>
           ) : (
@@ -222,26 +363,26 @@ function App() {
         </div>
 
         {/* Comparison */}
-        {backtestResult && performance && (
+        {backtestResult && (backtestResult.total_return !== undefined) && performance && (
           <div className="card comparison-card">
             <h2>Backtest vs Live</h2>
             <div className="comparison-stats">
               <div className="comparison-row">
                 <span className="label">Backtest predicted</span>
-                <span className={`value ${backtestResult.total_return >= 0 ? 'positive' : 'negative'}`}>
-                  {formatPercent(backtestResult.total_return)}
+                <span className={`value ${(backtestResult.total_return ?? 0) >= 0 ? 'positive' : 'negative'}`}>
+                  {formatPercent(backtestResult.total_return ?? 0)}
                 </span>
               </div>
               <div className="comparison-row">
                 <span className="label">Live performance</span>
-                <span className={`value ${performance.total_return >= 0 ? 'positive' : 'negative'}`}>
-                  {formatPercent(performance.total_return)}
+                <span className={`value ${(performance.total_return ?? 0) >= 0 ? 'positive' : 'negative'}`}>
+                  {formatPercent(performance.total_return ?? 0)}
                 </span>
               </div>
               <div className="comparison-row">
                 <span className="label">Gap</span>
                 <span className="value negative">
-                  {formatPercent((performance.total_return || 0) - (backtestResult.total_return || 0))}
+                  {formatPercent((performance.total_return ?? 0) - (backtestResult.total_return ?? 0))}
                 </span>
               </div>
             </div>
