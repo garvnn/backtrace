@@ -13,9 +13,9 @@ function App() {
   const [error, setError] = useState(null);
   const [tickerInput, setTickerInput] = useState('AAPL');
   const [backtestResult, setBacktestResult] = useState(null);
-  const [backtestLoading, setBacktestLoading] = useState(false);
+  const [runLoading, setRunLoading] = useState(false);
+  const [placeTradeLoading, setPlaceTradeLoading] = useState(false);
   const [backtestError, setBacktestError] = useState(null);
-  const [executorLoading, setExecutorLoading] = useState(false);
   const [executorError, setExecutorError] = useState(null);
   const [strategySelect, setStrategySelect] = useState('Momentum');
   const [shortMa, setShortMa] = useState(50);
@@ -24,6 +24,17 @@ function App() {
   const shortMaRef = useRef(null);
   const longMaRef = useRef(null);
   const lookbackRef = useRef(null);
+  const strategyFormRef = useRef(null);
+  // Params for runStrategy: synced from state so we send what the user sees (state is source of truth)
+  const paramsForRunRef = useRef({ strategy: 'Momentum', shortMa: 50, longMa: 200, lookbackPeriod: 120 });
+  useEffect(() => {
+    paramsForRunRef.current = {
+      strategy: strategySelect,
+      shortMa,
+      longMa,
+      lookbackPeriod,
+    };
+  }, [strategySelect, shortMa, longMa, lookbackPeriod]);
 
   useEffect(() => {
     fetchData();
@@ -74,24 +85,82 @@ function App() {
     return (value * 100).toFixed(2) + '%';
   };
 
-  const runExecutor = async () => {
-    setExecutorError(null);
-    setExecutorLoading(true);
-    const sw = shortMaRef.current ? Number(shortMaRef.current.value) : shortMa;
-    const lw = longMaRef.current ? Number(longMaRef.current.value) : longMa;
-    const lb = lookbackRef.current ? Number(lookbackRef.current.value) : lookbackPeriod;
+  // Store only fields needed for UI to avoid DataCloneError when state is cloned (e.g. by DevTools/profiling)
+  const setBacktestResultMinimal = (data) => {
+    if (!data || (data.equity_curve === undefined && data.total_return === undefined)) {
+      setBacktestResult(null);
+      return;
+    }
+    setBacktestResult({
+      ticker: data.ticker,
+      strategy: data.strategy,
+      total_return: data.total_return,
+      sharpe_ratio: data.sharpe_ratio,
+      max_drawdown: data.max_drawdown,
+      num_trades: data.num_trades,
+      equity_curve: Array.isArray(data.equity_curve) ? data.equity_curve : [],
+      params_used: data.params_used || null,
+    });
+  };
+
+  const runStrategy = async () => {
+    const ticker = tickerInput.trim().toUpperCase();
+    if (!ticker) return;
+
+    await new Promise((r) => setTimeout(r, 0));
+    const { strategy, shortMa, longMa, lookbackPeriod } = paramsForRunRef.current;
+
+    setBacktestError(null);
+    setBacktestResult(null);
+    setRunLoading(true);
     try {
-      const body = {
-        strategy: strategySelect,
-        ticker: tickerInput.trim().toUpperCase() || 'AAPL',
-        short_window: sw || 50,
-        long_window: lw || 200,
-        lookback_period: lb || 120,
+      const btBody = {
+        ticker,
+        start_date: '2020-01-01',
+        end_date: '2024-12-31',
+        strategy,
+        short_window: shortMa,
+        long_window: longMa,
+        lookback_period: lookbackPeriod,
       };
+      const btRes = await fetch(`${API_BASE}/backtest`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache', 'Pragma': 'no-cache' },
+        body: JSON.stringify(btBody),
+      });
+      const btData = await btRes.json().catch(() => ({}));
+      if (btRes.ok && btData && (btData.equity_curve !== undefined || btData.total_return !== undefined)) {
+        setBacktestResultMinimal(btData);
+      } else {
+        const msg = Array.isArray(btData.detail)
+          ? (btData.detail[0]?.msg || JSON.stringify(btData.detail))
+          : (typeof btData.detail === 'string' ? btData.detail : btData.detail || 'Backtest failed');
+        setBacktestError(msg);
+      }
+    } catch (err) {
+      setBacktestError(err.message || 'Backtest failed');
+    } finally {
+      setRunLoading(false);
+    }
+  };
+
+  const placeTrade = async () => {
+    await new Promise((r) => setTimeout(r, 0));
+    const { strategy, shortMa, longMa, lookbackPeriod } = paramsForRunRef.current;
+    const ticker = tickerInput.trim().toUpperCase() || 'AAPL';
+    setExecutorError(null);
+    setPlaceTradeLoading(true);
+    try {
       const res = await fetch(`${API_BASE}/run-executor`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
+        body: JSON.stringify({
+          strategy,
+          ticker,
+          short_window: shortMa,
+          long_window: longMa,
+          lookback_period: lookbackPeriod,
+        }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || 'Run failed');
@@ -99,52 +168,29 @@ function App() {
     } catch (err) {
       setExecutorError(err.message);
     } finally {
-      setExecutorLoading(false);
+      setPlaceTradeLoading(false);
     }
   };
 
-  const loadBacktest = async () => {
-    const ticker = tickerInput.trim().toUpperCase();
-    if (!ticker) return;
-    setBacktestError(null);
-    setBacktestLoading(true);
-    const sw = shortMaRef.current ? Number(shortMaRef.current.value) : shortMa;
-    const lw = longMaRef.current ? Number(longMaRef.current.value) : longMa;
-    const lb = lookbackRef.current ? Number(lookbackRef.current.value) : lookbackPeriod;
+  const deleteTrade = async (tradeId) => {
     try {
-      const body = {
-        ticker,
-        start_date: '2020-01-01',
-        end_date: '2024-12-31',
-        strategy: strategySelect,
-        short_window: sw || 50,
-        long_window: lw || 200,
-        lookback_period: lb || 120,
-      };
-      const res = await fetch(`${API_BASE}/backtest`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        const msg = Array.isArray(data.detail)
-          ? (data.detail[0]?.msg || JSON.stringify(data.detail))
-          : (typeof data.detail === 'string' ? data.detail : data.detail || 'Backtest failed');
-        throw new Error(msg);
-      }
-      if (data && (data.equity_curve !== undefined || data.total_return !== undefined)) {
-        setBacktestResult(data);
-      } else {
-        setBacktestResult(null);
-        setBacktestError('Backtest returned no data.');
+      const res = await fetch(`${API_BASE}/trades/${tradeId}`, { method: 'DELETE' });
+      if (!res.ok) throw new Error('Delete failed');
+      const tradesRes = await fetch(`${API_BASE}/trades`);
+      if (tradesRes.ok) {
+        const data = await tradesRes.json();
+        setTrades(data.trades);
       }
     } catch (err) {
-      setBacktestError(err.message || 'Backtest failed');
-      setBacktestResult(null);
-    } finally {
-      setBacktestLoading(false);
+      console.error('Delete trade error:', err);
     }
+  };
+
+  const formatTradeParams = (trade) => {
+    const p = trade.params;
+    if (!p) return '—';
+    if (trade.strategy === 'MeanReversion') return `Short ${p.short_window} / Long ${p.long_window}`;
+    return `Lookback ${p.lookback_period ?? '—'} days`;
   };
 
   // Combined chart data: live + backtest (backtest scaled to same start as live)
@@ -171,13 +217,17 @@ function App() {
       <header>
         <h1>BackTrace Live</h1>
         <p>Backtest vs Reality</p>
-        <div className="strategy-controls">
+        <div className="strategy-controls" ref={strategyFormRef}>
           <label className="strategy-label">Strategy</label>
           <select
             value={strategySelect}
-            onChange={(e) => setStrategySelect(e.target.value)}
+            onChange={(e) => {
+              const v = e.target.value;
+              setStrategySelect(v);
+              paramsForRunRef.current.strategy = v;
+            }}
             className="strategy-select"
-            disabled={backtestLoading || executorLoading}
+            disabled={runLoading || placeTradeLoading}
           >
             <option value="Momentum">Momentum</option>
             <option value="MA Crossover">MA Crossover</option>
@@ -187,21 +237,31 @@ function App() {
               <label className="param-label">Short MA (days)</label>
               <input
                 ref={shortMaRef}
+                name="short_window"
                 type="number"
                 min={1}
                 max={500}
                 value={shortMa}
-                onChange={(e) => setShortMa(Number(e.target.value) || 50)}
+                onChange={(e) => {
+                  const v = Number(e.target.value) || 50;
+                  setShortMa(v);
+                  paramsForRunRef.current.shortMa = v;
+                }}
                 className="param-input"
               />
               <label className="param-label">Long MA (days)</label>
               <input
                 ref={longMaRef}
+                name="long_window"
                 type="number"
                 min={1}
                 max={500}
                 value={longMa}
-                onChange={(e) => setLongMa(Number(e.target.value) || 200)}
+                onChange={(e) => {
+                  const v = Number(e.target.value) || 200;
+                  setLongMa(v);
+                  paramsForRunRef.current.longMa = v;
+                }}
                 className="param-input"
               />
             </>
@@ -211,11 +271,16 @@ function App() {
               <label className="param-label">Lookback (days)</label>
               <input
                 ref={lookbackRef}
+                name="lookback_period"
                 type="number"
                 min={1}
                 max={500}
                 value={lookbackPeriod}
-                onChange={(e) => setLookbackPeriod(Number(e.target.value) || 120)}
+                onChange={(e) => {
+                  const v = Number(e.target.value) || 120;
+                  setLookbackPeriod(v);
+                  paramsForRunRef.current.lookbackPeriod = v;
+                }}
                 className="param-input"
               />
             </>
@@ -228,15 +293,25 @@ function App() {
             onChange={(e) => setTickerInput(e.target.value)}
             placeholder="e.g. AAPL"
             className="ticker-input"
-            disabled={backtestLoading}
+            disabled={runLoading || placeTradeLoading}
           />
-          <button type="button" onClick={loadBacktest} disabled={backtestLoading} className="load-backtest-btn">
-            {backtestLoading ? 'Running…' : 'Load backtest'}
+          <button
+            type="button"
+            onClick={runStrategy}
+            disabled={runLoading || placeTradeLoading || !tickerInput.trim()}
+            className="run-strategy-btn"
+          >
+            {runLoading ? 'Running…' : 'Run strategy'}
+          </button>
+          <button
+            type="button"
+            onClick={placeTrade}
+            disabled={runLoading || placeTradeLoading || !tickerInput.trim()}
+            className="place-trade-btn"
+          >
+            {placeTradeLoading ? 'Placing…' : 'Place trade'}
           </button>
           {backtestError && <span className="backtest-error">{backtestError}</span>}
-          <button type="button" onClick={runExecutor} disabled={executorLoading} className="run-executor-btn">
-            {executorLoading ? 'Running…' : 'Run strategy now'}
-          </button>
           {executorError && <span className="backtest-error">{executorError}</span>}
         </div>
       </header>
@@ -358,7 +433,7 @@ function App() {
               </div>
             </div>
           ) : (
-            <div className="empty-placeholder">Enter a ticker and click Load backtest</div>
+            <div className="empty-placeholder">Enter a ticker, set strategy and params, then click Run strategy</div>
           )}
         </div>
 
@@ -433,9 +508,9 @@ function App() {
           )}
         </div>
 
-        {/* Recent Trades */}
+        {/* Trades */}
         <div className="card">
-          <h2>Recent Trades</h2>
+          <h2>Trades</h2>
           <div className="trades-table">
             {loading && trades.length === 0 ? (
               <div className="loading-placeholder">Loading...</div>
@@ -444,22 +519,30 @@ function App() {
               <thead>
                 <tr>
                   <th>Time</th>
+                  <th>Strategy</th>
+                  <th>Params</th>
                   <th>Side</th>
                   <th>Ticker</th>
                   <th>Qty</th>
                   <th>Price</th>
                   <th>Status</th>
+                  <th>Actions</th>
                 </tr>
               </thead>
               <tbody>
-                {trades.slice(0, 10).map(trade => (
+                {trades.map(trade => (
                   <tr key={trade.id}>
                     <td>{new Date(trade.timestamp).toLocaleString()}</td>
+                    <td>{trade.strategy ?? '—'}</td>
+                    <td>{formatTradeParams(trade)}</td>
                     <td className={trade.side === 'BUY' ? 'buy' : 'sell'}>{trade.side}</td>
                     <td>{trade.ticker}</td>
                     <td>{trade.qty}</td>
                     <td>{trade.price ? formatCurrency(trade.price) : '-'}</td>
                     <td>{trade.status}</td>
+                    <td>
+                      <button type="button" className="delete-trade-btn" onClick={() => deleteTrade(trade.id)}>Delete</button>
+                    </td>
                   </tr>
                 ))}
               </tbody>

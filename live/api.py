@@ -28,6 +28,19 @@ app.add_middleware(
 
 db = Database(os.path.join(LIVE_DIR, "trading.db"))
 
+# Max equity curve points returned to frontend to avoid OOM / DataCloneError
+EQUITY_CURVE_MAX_POINTS = 400
+
+
+def _downsample_equity_curve(equity_curve: list, max_points: int = EQUITY_CURVE_MAX_POINTS) -> list:
+    """Return a downsampled copy of equity_curve with at most max_points, evenly spaced. Keeps first and last."""
+    if not equity_curve or len(equity_curve) <= max_points:
+        return equity_curve
+    n = len(equity_curve)
+    step = (n - 1) / (max_points - 1)
+    indices = [0] + [int(round(i * step)) for i in range(1, max_points - 1)] + [n - 1]
+    return [equity_curve[i] for i in indices]
+
 
 @app.get("/")
 def read_root():
@@ -56,24 +69,17 @@ def get_portfolio():
 
 @app.get("/trades")
 def get_trades(strategy: str = None):
-    """Get all trades, optionally filtered by strategy."""
+    """Get all trades, optionally filtered by strategy. Each trade includes params if stored."""
     trades = db.get_all_trades(strategy=strategy)
-    
-    trades_list = []
-    for trade in trades:
-        trades_list.append({
-            "id": trade[0],
-            "timestamp": trade[1],
-            "strategy": trade[2],
-            "ticker": trade[3],
-            "side": trade[4],
-            "qty": trade[5],
-            "price": trade[6],
-            "order_id": trade[7],
-            "status": trade[8]
-        })
-    
-    return {"trades": trades_list}
+    return {"trades": trades}
+
+
+@app.delete("/trades/{trade_id}")
+def delete_trade(trade_id: int):
+    """Delete a trade by id."""
+    if not db.delete_trade(trade_id):
+        raise HTTPException(status_code=404, detail="Trade not found")
+    return {"ok": True}
 
 
 @app.get("/portfolio-history")
@@ -175,7 +181,9 @@ def run_backtest(req: BacktestRequest):
     finally:
         os.chdir(old_cwd)
     saved = db.get_backtest_results(ticker=ticker, strategy=strategy_name)
-    result = saved[0] if saved else {}
+    # Return a new dict with params_used so the client sees exactly what was used
+    result = dict(saved[0]) if saved else {}
+    result["equity_curve"] = _downsample_equity_curve(result.get("equity_curve") or [])
     result["params_used"] = {
         "strategy": strategy_name,
         "short_window": req.short_window,
@@ -187,8 +195,10 @@ def run_backtest(req: BacktestRequest):
 
 @app.get("/backtest-results")
 def get_backtest_results(ticker: str = None, strategy: str = None):
-    """Get saved backtest results, optionally filtered by ticker and/or strategy."""
+    """Get saved backtest results, optionally filtered by ticker and/or strategy. Equity curves are downsampled."""
     results = db.get_backtest_results(ticker=ticker, strategy=strategy)
+    for r in results:
+        r["equity_curve"] = _downsample_equity_curve(r.get("equity_curve") or [])
     return {"results": results}
 
 
@@ -213,7 +223,8 @@ def run_executor(req: RunExecutorRequest = None):
         os.chdir(LIVE_DIR)
         from executor import StrategyExecutor
         strategy = _build_strategy(strategy_name, req.short_window, req.long_window, req.lookback_period)
-        executor = StrategyExecutor(strategy, ticker=ticker)
+        params = {"short_window": req.short_window, "long_window": req.long_window, "lookback_period": req.lookback_period}
+        executor = StrategyExecutor(strategy, ticker=ticker, params=params)
         executor.run()
         return {
             "ok": True,

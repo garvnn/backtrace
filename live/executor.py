@@ -26,9 +26,10 @@ _env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
 load_dotenv(_env_path)
 
 class StrategyExecutor:
-    def __init__(self, strategy, ticker='AAPL'):
+    def __init__(self, strategy, ticker='AAPL', params=None):
         self.strategy = strategy
         self.ticker = ticker
+        self.params = params  # optional dict e.g. short_window, long_window, lookback_period for logging
         api_key = os.getenv('ALPACA_API_KEY')
         secret_key = os.getenv('ALPACA_SECRET_KEY')
         if not api_key or not secret_key:
@@ -123,7 +124,8 @@ class StrategyExecutor:
                     qty=qty,
                     price=current_price,
                     order_id=str(order.id),
-                    status=str(order.status)
+                    status=str(order.status),
+                    params=self.params,
                 )
                 
                 return order
@@ -146,7 +148,8 @@ class StrategyExecutor:
                 side='SELL',
                 qty=current_position,
                 order_id=str(order.id),
-                status=str(order.status)
+                status=str(order.status),
+                params=self.params,
             )
             
             return order

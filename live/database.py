@@ -27,10 +27,14 @@ class Database:
                 qty REAL NOT NULL,
                 price REAL,
                 order_id TEXT,
-                status TEXT
+                status TEXT,
+                params TEXT
             )
         ''')
-        
+        try:
+            cursor.execute('ALTER TABLE trades ADD COLUMN params TEXT')
+        except sqlite3.OperationalError:
+            pass  # column already exists
         # Portfolio snapshots table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS portfolio_snapshots (
@@ -63,15 +67,15 @@ class Database:
         conn.close()
         print("Database initialized")
     
-    def log_trade(self, strategy, ticker, side, qty, price=None, order_id=None, status='submitted'):
-        """Log a trade to database."""
+    def log_trade(self, strategy, ticker, side, qty, price=None, order_id=None, status='submitted', params=None):
+        """Log a trade to database. params is optional dict stored as JSON (e.g. short_window, long_window, lookback_period)."""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
-        
+        params_json = json.dumps(params) if params is not None else None
         cursor.execute('''
-            INSERT INTO trades (timestamp, strategy, ticker, side, qty, price, order_id, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (datetime.now().isoformat(), strategy, ticker, side, qty, price, order_id, status))
+            INSERT INTO trades (timestamp, strategy, ticker, side, qty, price, order_id, status, params)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (datetime.now().isoformat(), strategy, ticker, side, qty, price, order_id, status, params_json))
         
         conn.commit()
         conn.close()
@@ -110,18 +114,46 @@ class Database:
         conn.close()
     
     def get_all_trades(self, strategy=None):
-        """Get all trades, optionally filtered by strategy."""
+        """Get all trades, optionally filtered by strategy. Returns list of dicts with id, timestamp, strategy, ticker, side, qty, price, order_id, status, params (parsed)."""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
-        
         if strategy:
-            cursor.execute('SELECT * FROM trades WHERE strategy = ? ORDER BY timestamp DESC', (strategy,))
+            cursor.execute('SELECT id, timestamp, strategy, ticker, side, qty, price, order_id, status, params FROM trades WHERE strategy = ? ORDER BY timestamp DESC', (strategy,))
         else:
-            cursor.execute('SELECT * FROM trades ORDER BY timestamp DESC')
-        
-        trades = cursor.fetchall()
+            cursor.execute('SELECT id, timestamp, strategy, ticker, side, qty, price, order_id, status, params FROM trades ORDER BY timestamp DESC')
+        rows = cursor.fetchall()
         conn.close()
-        return trades
+        out = []
+        for row in rows:
+            params = None
+            if len(row) > 9 and row[9]:
+                try:
+                    params = json.loads(row[9])
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            out.append({
+                "id": row[0],
+                "timestamp": row[1],
+                "strategy": row[2],
+                "ticker": row[3],
+                "side": row[4],
+                "qty": row[5],
+                "price": row[6],
+                "order_id": row[7],
+                "status": row[8],
+                "params": params,
+            })
+        return out
+
+    def delete_trade(self, trade_id):
+        """Delete a trade by id. Returns True if a row was deleted."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM trades WHERE id = ?', (trade_id,))
+        deleted = cursor.rowcount
+        conn.commit()
+        conn.close()
+        return deleted > 0
     
     def get_portfolio_history(self, strategy=None):
         """Get portfolio value history."""

@@ -114,7 +114,7 @@ header p {
   font-size: 0.9rem;
 }
 
-.run-executor-btn {
+.run-strategy-btn {
   padding: 0.5rem 1rem;
   border-radius: 8px;
   border: none;
@@ -125,13 +125,47 @@ header p {
   font-size: 0.95rem;
 }
 
-.run-executor-btn:hover:not(:disabled) {
+.run-strategy-btn:hover:not(:disabled) {
   background: #16a34a;
 }
 
-.run-executor-btn:disabled {
+.run-strategy-btn:disabled {
   opacity: 0.7;
   cursor: not-allowed;
+}
+
+.place-trade-btn {
+  padding: 0.5rem 1rem;
+  border-radius: 8px;
+  border: none;
+  background: #2E86AB;
+  color: #fff;
+  font-weight: 600;
+  cursor: pointer;
+  font-size: 0.95rem;
+}
+
+.place-trade-btn:hover:not(:disabled) {
+  background: #236b8a;
+}
+
+.place-trade-btn:disabled {
+  opacity: 0.7;
+  cursor: not-allowed;
+}
+
+.delete-trade-btn {
+  padding: 0.25rem 0.5rem;
+  border-radius: 4px;
+  border: 1px solid #f87171;
+  background: transparent;
+  color: #f87171;
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+
+.delete-trade-btn:hover {
+  background: rgba(248, 113, 113, 0.15);
 }
 
 .comparison-card .comparison-stats {
