@@ -63,6 +63,26 @@ class Database:
             )
         ''')
         
+        # Pair trades table (stat arb)
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS pair_trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                strategy TEXT NOT NULL,
+                pair_name TEXT NOT NULL,
+                ticker_a TEXT NOT NULL,
+                ticker_b TEXT NOT NULL,
+                side_a TEXT NOT NULL,
+                side_b TEXT NOT NULL,
+                qty_a REAL NOT NULL,
+                qty_b REAL NOT NULL,
+                spread REAL,
+                z_score REAL,
+                order_id_a TEXT,
+                order_id_b TEXT
+            )
+        ''')
+        
         conn.commit()
         conn.close()
         print("Database initialized")
@@ -154,6 +174,58 @@ class Database:
         conn.commit()
         conn.close()
         return deleted > 0
+
+    def log_pair_trade(self, strategy, pair_name, ticker_a, ticker_b, side_a, side_b,
+                       qty_a, qty_b, spread=None, z_score=None, order_id_a=None, order_id_b=None):
+        """Log a pair trade (both legs) for stat arb."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO pair_trades 
+            (timestamp, strategy, pair_name, ticker_a, ticker_b, side_a, side_b, qty_a, qty_b, spread, z_score, order_id_a, order_id_b)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (datetime.now().isoformat(), strategy, pair_name, ticker_a, ticker_b, side_a, side_b,
+              qty_a, qty_b, spread, z_score, order_id_a, order_id_b))
+        conn.commit()
+        conn.close()
+
+    def get_pair_trades(self, strategy=None):
+        """Get pair trades, optionally filtered by strategy. Returns list of dicts."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        if strategy:
+            cursor.execute('''
+                SELECT id, timestamp, strategy, pair_name, ticker_a, ticker_b, side_a, side_b,
+                       qty_a, qty_b, spread, z_score, order_id_a, order_id_b
+                FROM pair_trades WHERE strategy = ? ORDER BY timestamp DESC
+            ''', (strategy,))
+        else:
+            cursor.execute('''
+                SELECT id, timestamp, strategy, pair_name, ticker_a, ticker_b, side_a, side_b,
+                       qty_a, qty_b, spread, z_score, order_id_a, order_id_b
+                FROM pair_trades ORDER BY timestamp DESC
+            ''')
+        rows = cursor.fetchall()
+        conn.close()
+        return [
+            {
+                "id": row[0],
+                "timestamp": row[1],
+                "strategy": row[2],
+                "pair_name": row[3],
+                "ticker_a": row[4],
+                "ticker_b": row[5],
+                "side_a": row[6],
+                "side_b": row[7],
+                "qty_a": row[8],
+                "qty_b": row[9],
+                "spread": row[10],
+                "z_score": row[11],
+                "order_id_a": row[12],
+                "order_id_b": row[13],
+            }
+            for row in rows
+        ]
     
     def get_portfolio_history(self, strategy=None):
         """Get portfolio value history."""

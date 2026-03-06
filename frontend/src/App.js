@@ -21,20 +21,29 @@ function App() {
   const [shortMa, setShortMa] = useState(50);
   const [longMa, setLongMa] = useState(200);
   const [lookbackPeriod, setLookbackPeriod] = useState(120);
+  const [pairs, setPairs] = useState([]);
+  const [pairTrades, setPairTrades] = useState([]);
+  const [tickerB, setTickerB] = useState('MSFT');
+  const [statArbLookback, setStatArbLookback] = useState(60);
+  const [statArbEntry, setStatArbEntry] = useState(2);
+  const [statArbExit, setStatArbExit] = useState(0.5);
   const shortMaRef = useRef(null);
   const longMaRef = useRef(null);
   const lookbackRef = useRef(null);
   const strategyFormRef = useRef(null);
-  // Params for runStrategy: synced from state so we send what the user sees (state is source of truth)
-  const paramsForRunRef = useRef({ strategy: 'Momentum', shortMa: 50, longMa: 200, lookbackPeriod: 120 });
+  const paramsForRunRef = useRef({ strategy: 'Momentum', shortMa: 50, longMa: 200, lookbackPeriod: 120, tickerB: 'MSFT', statArbLookback: 60, statArbEntry: 2, statArbExit: 0.5 });
   useEffect(() => {
     paramsForRunRef.current = {
       strategy: strategySelect,
       shortMa,
       longMa,
       lookbackPeriod,
+      tickerB,
+      statArbLookback,
+      statArbEntry,
+      statArbExit,
     };
-  }, [strategySelect, shortMa, longMa, lookbackPeriod]);
+  }, [strategySelect, shortMa, longMa, lookbackPeriod, tickerB, statArbLookback, statArbEntry, statArbExit]);
 
   useEffect(() => {
     fetchData();
@@ -64,6 +73,17 @@ function App() {
       if (!historyRes.ok) throw new Error('Failed to fetch history');
       const historyData = await historyRes.json();
       setHistory(historyData.history);
+
+      const pairsRes = await fetch(`${API_BASE}/pairs?strategy=Stat%20Arb`);
+      if (pairsRes.ok) {
+        const pairsData = await pairsRes.json();
+        setPairs(pairsData.pairs || []);
+      }
+      const pairTradesRes = await fetch(`${API_BASE}/pair-trades`);
+      if (pairTradesRes.ok) {
+        const pairTradesData = await pairTradesRes.json();
+        setPairTrades(pairTradesData.pair_trades || []);
+      }
     } catch (err) {
       console.error('Error fetching data:', err);
       setError(err.message);
@@ -86,10 +106,22 @@ function App() {
   };
 
   // Store only fields needed for UI to avoid DataCloneError when state is cloned (e.g. by DevTools/profiling)
-  const setBacktestResultMinimal = (data) => {
+  // sentParams: for Stat Arb, merge in so display always shows what we sent (API can omit keys)
+  const setBacktestResultMinimal = (data, sentParams = null) => {
     if (!data || (data.equity_curve === undefined && data.total_return === undefined)) {
       setBacktestResult(null);
       return;
+    }
+    let params_used = data.params_used || null;
+    if (sentParams && (data.strategy === 'Stat Arb' || sentParams.strategy === 'Stat Arb')) {
+      params_used = {
+        strategy: data.strategy || sentParams.strategy || 'Stat Arb',
+        ticker_a: data.params_used?.ticker_a ?? sentParams.ticker_a ?? data.ticker?.split('-')[0],
+        ticker_b: data.params_used?.ticker_b ?? sentParams.ticker_b ?? data.ticker?.split('-')[1],
+        lookback: data.params_used?.lookback ?? sentParams.lookback,
+        entry_threshold: data.params_used?.entry_threshold ?? sentParams.entry_threshold,
+        exit_threshold: data.params_used?.exit_threshold ?? sentParams.exit_threshold,
+      };
     }
     setBacktestResult({
       ticker: data.ticker,
@@ -99,7 +131,7 @@ function App() {
       max_drawdown: data.max_drawdown,
       num_trades: data.num_trades,
       equity_curve: Array.isArray(data.equity_curve) ? data.equity_curve : [],
-      params_used: data.params_used || null,
+      params_used,
     });
   };
 
@@ -108,10 +140,21 @@ function App() {
     if (!ticker) return;
 
     await new Promise((r) => setTimeout(r, 0));
-    const { strategy, shortMa, longMa, lookbackPeriod } = paramsForRunRef.current;
+    // Read from ref so we send the values currently in the form (ref is updated synchronously in onChange; state can be stale if user clicks Run before re-render)
+    const { strategy, shortMa, longMa, lookbackPeriod, tickerB: refTickerB, statArbLookback: refLookback, statArbEntry: refEntry, statArbExit: refExit } = paramsForRunRef.current;
+    const tickerBVal = (strategy === 'Stat Arb' ? (refTickerB || '').trim().toUpperCase() : '');
+    const statArbLookbackVal = strategy === 'Stat Arb' ? (Number(refLookback) || 60) : 60;
+    const statArbEntryVal = strategy === 'Stat Arb' ? (Number(refEntry) || 2) : 2;
+    const statArbExitVal = strategy === 'Stat Arb' ? (Number(refExit) || 0.5) : 0.5;
 
     setBacktestError(null);
     setBacktestResult(null);
+
+    if (strategy === 'Stat Arb' && !tickerBVal) {
+      setBacktestError('Stat Arb requires Ticker B.');
+      return;
+    }
+
     setRunLoading(true);
     try {
       const btBody = {
@@ -123,14 +166,33 @@ function App() {
         long_window: longMa,
         lookback_period: lookbackPeriod,
       };
+      if (strategy === 'Stat Arb') {
+        btBody.ticker_b = tickerBVal;
+        btBody.lookback = statArbLookbackVal;
+        btBody.entry_threshold = statArbEntryVal;
+        btBody.exit_threshold = statArbExitVal;
+      }
       const btRes = await fetch(`${API_BASE}/backtest`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache', 'Pragma': 'no-cache' },
+        headers: {
+          'Content-Type': 'application/json',
+          'Cache-Control': 'no-cache',
+          'Pragma': 'no-cache',
+          'Cache-Bust': String(Date.now()),
+        },
         body: JSON.stringify(btBody),
       });
       const btData = await btRes.json().catch(() => ({}));
       if (btRes.ok && btData && (btData.equity_curve !== undefined || btData.total_return !== undefined)) {
-        setBacktestResultMinimal(btData);
+        const sentParams = strategy === 'Stat Arb' ? {
+          strategy: 'Stat Arb',
+          ticker_a: ticker,
+          ticker_b: tickerBVal,
+          lookback: statArbLookbackVal,
+          entry_threshold: statArbEntryVal,
+          exit_threshold: statArbExitVal,
+        } : null;
+        setBacktestResultMinimal(btData, sentParams);
       } else {
         const msg = Array.isArray(btData.detail)
           ? (btData.detail[0]?.msg || JSON.stringify(btData.detail))
@@ -146,21 +208,29 @@ function App() {
 
   const placeTrade = async () => {
     await new Promise((r) => setTimeout(r, 0));
-    const { strategy, shortMa, longMa, lookbackPeriod } = paramsForRunRef.current;
+    const { strategy, shortMa, longMa, lookbackPeriod, tickerB: tb, statArbLookback: sal, statArbEntry: sae, statArbExit: sax } = paramsForRunRef.current;
     const ticker = tickerInput.trim().toUpperCase() || 'AAPL';
+    const tickerBVal = (tb || '').trim().toUpperCase();
     setExecutorError(null);
     setPlaceTradeLoading(true);
     try {
+      const body = {
+        strategy,
+        ticker,
+        short_window: shortMa,
+        long_window: longMa,
+        lookback_period: lookbackPeriod,
+      };
+      if (strategy === 'Stat Arb') {
+        body.ticker_b = tickerBVal;
+        body.lookback = sal;
+        body.entry_threshold = sae;
+        body.exit_threshold = sax;
+      }
       const res = await fetch(`${API_BASE}/run-executor`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          strategy,
-          ticker,
-          short_window: shortMa,
-          long_window: longMa,
-          lookback_period: lookbackPeriod,
-        }),
+        body: JSON.stringify(body),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || 'Run failed');
@@ -231,7 +301,47 @@ function App() {
           >
             <option value="Momentum">Momentum</option>
             <option value="MA Crossover">MA Crossover</option>
+            <option value="Stat Arb">Stat Arb</option>
           </select>
+          {strategySelect === 'Stat Arb' && (
+            <>
+              <label className="param-label">Ticker B</label>
+              <input
+                type="text"
+                value={tickerB}
+                onChange={(e) => { setTickerB(e.target.value); paramsForRunRef.current.tickerB = e.target.value; }}
+                placeholder="e.g. MSFT"
+                className="param-input"
+              />
+              <label className="param-label">Lookback (days)</label>
+              <input
+                type="number"
+                min={10}
+                max={252}
+                value={statArbLookback}
+                onChange={(e) => { const v = Number(e.target.value) || 60; setStatArbLookback(v); paramsForRunRef.current.statArbLookback = v; }}
+                className="param-input"
+              />
+              <label className="param-label">Entry z</label>
+              <input
+                type="number"
+                min={0.5}
+                step={0.1}
+                value={statArbEntry}
+                onChange={(e) => { const v = Number(e.target.value) || 2; setStatArbEntry(v); paramsForRunRef.current.statArbEntry = v; }}
+                className="param-input"
+              />
+              <label className="param-label">Exit z</label>
+              <input
+                type="number"
+                min={0}
+                step={0.1}
+                value={statArbExit}
+                onChange={(e) => { const v = Number(e.target.value) || 0.5; setStatArbExit(v); paramsForRunRef.current.statArbExit = v; }}
+                className="param-input"
+              />
+            </>
+          )}
           {strategySelect === 'MA Crossover' && (
             <>
               <label className="param-label">Short MA (days)</label>
@@ -291,7 +401,7 @@ function App() {
             type="text"
             value={tickerInput}
             onChange={(e) => setTickerInput(e.target.value)}
-            placeholder="e.g. AAPL"
+            placeholder={strategySelect === 'Stat Arb' ? 'Ticker A e.g. AAPL' : 'e.g. AAPL'}
             className="ticker-input"
             disabled={runLoading || placeTradeLoading}
           />
@@ -306,7 +416,7 @@ function App() {
           <button
             type="button"
             onClick={placeTrade}
-            disabled={runLoading || placeTradeLoading || !tickerInput.trim()}
+            disabled={runLoading || placeTradeLoading || !tickerInput.trim() || (strategySelect === 'Stat Arb' && !tickerB.trim())}
             className="place-trade-btn"
           >
             {placeTradeLoading ? 'Placing…' : 'Place trade'}
@@ -325,7 +435,13 @@ function App() {
       <div className="container">
         <div className="card strategy-help chart-card">
           <h2>How the strategies work</h2>
-          {strategySelect === 'MA Crossover' ? (
+          {strategySelect === 'Stat Arb' ? (
+            <div className="help-content">
+              <p><strong>Stat Arb (statistical arbitrage / pairs trading)</strong></p>
+              <p>Trade two <strong>cointegrated</strong> stocks (e.g. AAPL/MSFT, KO/PEP). The spread is log(price_A) − β·log(price_B). When the spread&apos;s <strong>z-score</strong> exceeds the entry threshold, the strategy goes short the spread (sell A, buy B); when z-score is below −entry, it goes long (buy A, sell B). It closes when |z| &lt; exit threshold.</p>
+              <p><strong>Lookback</strong> is the window (days) for spread mean/std. <strong>Entry z</strong> and <strong>Exit z</strong> control when to open and close. Use <code>live/pairs_finder.py</code> to discover cointegrated pairs.</p>
+            </div>
+          ) : strategySelect === 'MA Crossover' ? (
             <div className="help-content">
               <p><strong>MA Crossover (moving average crossover)</strong></p>
               <p><strong>Short MA</strong> and <strong>Long MA</strong> are the number of trading days used to compute two moving averages of the stock&apos;s closing price. The short MA reacts faster to recent prices; the long MA is smoother.</p>
@@ -347,6 +463,24 @@ function App() {
             <div className="loading-placeholder">Loading...</div>
           ) : portfolio ? (
             <div className="stats">
+              {strategySelect === 'Stat Arb' && pairs.length > 0 ? (
+                <>
+                  <div className="stat">
+                    <span className="label">Positions</span>
+                    <span className="value" style={{ display: 'block' }}>
+                      {pairs.map((p, i) => (
+                        <span key={i}>
+                          {p.ticker_a}: {p.qty_a} shares · {p.ticker_b}: {p.qty_b} shares
+                        </span>
+                      ))}
+                    </span>
+                  </div>
+                  <div className="stat">
+                    <span className="label">Combined Value</span>
+                    <span className="value">{formatCurrency(pairs[0].combined_value)}</span>
+                  </div>
+                </>
+              ) : null}
               <div className="stat">
                 <span className="label">Portfolio Value</span>
                 <span className="value">{formatCurrency(portfolio.portfolio_value)}</span>
@@ -407,9 +541,11 @@ function App() {
                 <div className="stat params-used">
                   <span className="label">Params used</span>
                   <span className="value params-text">
-                    {backtestResult.params_used.strategy === 'MeanReversion'
-                      ? `Short MA ${backtestResult.params_used.short_window}, Long MA ${backtestResult.params_used.long_window}`
-                      : `Lookback ${backtestResult.params_used.lookback_period} days`}
+                    {backtestResult.params_used.strategy === 'Stat Arb'
+                      ? `${backtestResult.params_used.ticker_a ?? backtestResult.ticker?.split('-')[0] ?? '—'}-${backtestResult.params_used.ticker_b ?? backtestResult.ticker?.split('-')[1] ?? '—'}, lookback ${backtestResult.params_used.lookback ?? '—'}, entry z ${backtestResult.params_used.entry_threshold ?? '—'}, exit z ${backtestResult.params_used.exit_threshold ?? '—'}`
+                      : backtestResult.params_used.strategy === 'MeanReversion'
+                        ? `Short MA ${backtestResult.params_used.short_window ?? '—'}, Long MA ${backtestResult.params_used.long_window ?? '—'}`
+                        : `Lookback ${backtestResult.params_used.lookback_period ?? '—'} days`}
                   </span>
                 </div>
               )}
@@ -433,7 +569,9 @@ function App() {
               </div>
             </div>
           ) : (
-            <div className="empty-placeholder">Enter a ticker, set strategy and params, then click Run strategy</div>
+            <div className="empty-placeholder">
+              Enter ticker(s), set strategy and params, then click Run strategy
+            </div>
           )}
         </div>
 
@@ -512,8 +650,39 @@ function App() {
         <div className="card">
           <h2>Trades</h2>
           <div className="trades-table">
-            {loading && trades.length === 0 ? (
+            {loading && trades.length === 0 && pairTrades.length === 0 ? (
               <div className="loading-placeholder">Loading...</div>
+            ) : strategySelect === 'Stat Arb' && pairTrades.length > 0 ? (
+              <table>
+                <thead>
+                  <tr>
+                    <th>Time</th>
+                    <th>Strategy</th>
+                    <th>Pair</th>
+                    <th>Side A</th>
+                    <th>Side B</th>
+                    <th>Qty A</th>
+                    <th>Qty B</th>
+                    <th>Spread</th>
+                    <th>Z-score</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {pairTrades.map(pt => (
+                    <tr key={pt.id}>
+                      <td>{new Date(pt.timestamp).toLocaleString()}</td>
+                      <td>{pt.strategy ?? '—'}</td>
+                      <td>{pt.pair_name ?? `${pt.ticker_a}-${pt.ticker_b}`}</td>
+                      <td className={pt.side_a === 'BUY' ? 'buy' : 'sell'}>{pt.side_a}</td>
+                      <td className={pt.side_b === 'BUY' ? 'buy' : 'sell'}>{pt.side_b}</td>
+                      <td>{pt.qty_a}</td>
+                      <td>{pt.qty_b}</td>
+                      <td>{pt.spread != null ? Number(pt.spread).toFixed(4) : '—'}</td>
+                      <td>{pt.z_score != null ? Number(pt.z_score).toFixed(2) : '—'}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
             ) : (
             <table>
               <thead>
