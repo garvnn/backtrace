@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
+import { LineChart, Line, BarChart, Bar, ComposedChart, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
 import './App.css';
 
 const API_BASE = 'http://localhost:8000';
@@ -27,6 +27,10 @@ function App() {
   const [statArbLookback, setStatArbLookback] = useState(60);
   const [statArbEntry, setStatArbEntry] = useState(2);
   const [statArbExit, setStatArbExit] = useState(0.5);
+  const [monteCarloData, setMonteCarloData] = useState(null);
+  const [showMonteCarlo, setShowMonteCarlo] = useState(false);
+  const [monteCarloLoading, setMonteCarloLoading] = useState(false);
+  const [monteCarloError, setMonteCarloError] = useState(null);
   const shortMaRef = useRef(null);
   const longMaRef = useRef(null);
   const lookbackRef = useRef(null);
@@ -149,6 +153,9 @@ function App() {
 
     setBacktestError(null);
     setBacktestResult(null);
+    setShowMonteCarlo(false);
+    setMonteCarloData(null);
+    setMonteCarloError(null);
 
     if (strategy === 'Stat Arb' && !tickerBVal) {
       setBacktestError('Stat Arb requires Ticker B.');
@@ -203,6 +210,39 @@ function App() {
       setBacktestError(err.message || 'Backtest failed');
     } finally {
       setRunLoading(false);
+    }
+  };
+
+  const fetchMonteCarlo = async (ticker, strategy) => {
+    setMonteCarloError(null);
+    setMonteCarloLoading(true);
+    try {
+      const res = await fetch(
+        `${API_BASE}/monte-carlo?ticker=${encodeURIComponent(ticker)}&strategy=${encodeURIComponent(strategy)}&runs=10000`
+      );
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setMonteCarloData(null);
+        const detail = typeof data.detail === 'string' ? data.detail : null;
+        const message = res.status === 404 && detail === 'Not Found'
+          ? 'Monte Carlo endpoint not available. Restart the API server (from the live/ folder: uvicorn api:app --reload).'
+          : (detail || 'Monte Carlo request failed');
+        setMonteCarloError(message);
+        return;
+      }
+      if (data.error) {
+        setMonteCarloData(null);
+        setMonteCarloError(data.error);
+        return;
+      }
+      setMonteCarloData(data);
+      setShowMonteCarlo(true);
+    } catch (err) {
+      console.error('Error fetching Monte Carlo:', err);
+      setMonteCarloData(null);
+      setMonteCarloError(err.message || 'Failed to run Monte Carlo');
+    } finally {
+      setMonteCarloLoading(false);
     }
   };
 
@@ -532,47 +572,71 @@ function App() {
           )}
         </div>
 
-        {/* Backtest Results */}
-        <div className="card">
-          <h2>Backtest Results {backtestResult?.ticker && `(${backtestResult.ticker})`}</h2>
-          {backtestResult && (backtestResult.total_return !== undefined || backtestResult.equity_curve) ? (
-            <div className="stats">
-              {backtestResult.params_used && (
-                <div className="stat params-used">
-                  <span className="label">Params used</span>
-                  <span className="value params-text">
-                    {backtestResult.params_used.strategy === 'Stat Arb'
-                      ? `${backtestResult.params_used.ticker_a ?? backtestResult.ticker?.split('-')[0] ?? '—'}-${backtestResult.params_used.ticker_b ?? backtestResult.ticker?.split('-')[1] ?? '—'}, lookback ${backtestResult.params_used.lookback ?? '—'}, entry z ${backtestResult.params_used.entry_threshold ?? '—'}, exit z ${backtestResult.params_used.exit_threshold ?? '—'}`
-                      : backtestResult.params_used.strategy === 'MeanReversion'
-                        ? `Short MA ${backtestResult.params_used.short_window ?? '—'}, Long MA ${backtestResult.params_used.long_window ?? '—'}`
-                        : `Lookback ${backtestResult.params_used.lookback_period ?? '—'} days`}
+        {/* Backtest Results + Monte Carlo (stacked in analysis column) */}
+        <div className="analysis-column">
+          <div className="card">
+            <h2>Backtest Results {backtestResult?.ticker && `(${backtestResult.ticker})`}</h2>
+            {backtestResult && (backtestResult.total_return !== undefined || backtestResult.equity_curve) ? (
+              <div className="stats">
+                {backtestResult.params_used && (
+                  <div className="stat params-used">
+                    <span className="label">Params used</span>
+                    <span className="value params-text">
+                      {backtestResult.params_used.strategy === 'Stat Arb'
+                        ? `${backtestResult.params_used.ticker_a ?? backtestResult.ticker?.split('-')[0] ?? '—'}-${backtestResult.params_used.ticker_b ?? backtestResult.ticker?.split('-')[1] ?? '—'}, lookback ${backtestResult.params_used.lookback ?? '—'}, entry z ${backtestResult.params_used.entry_threshold ?? '—'}, exit z ${backtestResult.params_used.exit_threshold ?? '—'}`
+                        : backtestResult.params_used.strategy === 'MeanReversion'
+                          ? `Short MA ${backtestResult.params_used.short_window ?? '—'}, Long MA ${backtestResult.params_used.long_window ?? '—'}`
+                          : `Lookback ${backtestResult.params_used.lookback_period ?? '—'} days`}
+                    </span>
+                  </div>
+                )}
+                <div className="stat">
+                  <span className="label">Total Return</span>
+                  <span className={`value ${(backtestResult.total_return ?? 0) >= 0 ? 'positive' : 'negative'}`}>
+                    {formatPercent(backtestResult.total_return ?? 0)}
                   </span>
                 </div>
-              )}
-              <div className="stat">
-                <span className="label">Total Return</span>
-                <span className={`value ${(backtestResult.total_return ?? 0) >= 0 ? 'positive' : 'negative'}`}>
-                  {formatPercent(backtestResult.total_return ?? 0)}
-                </span>
+                <div className="stat">
+                  <span className="label">Sharpe Ratio</span>
+                  <span className="value">{Number(backtestResult.sharpe_ratio ?? 0).toFixed(2)}</span>
+                </div>
+                <div className="stat">
+                  <span className="label">Max Drawdown</span>
+                  <span className="value negative">{formatPercent(backtestResult.max_drawdown ?? 0)}</span>
+                </div>
+                <div className="stat">
+                  <span className="label">Number of Trades</span>
+                  <span className="value">{backtestResult.num_trades ?? 0}</span>
+                </div>
               </div>
-              <div className="stat">
-                <span className="label">Sharpe Ratio</span>
-                <span className="value">{Number(backtestResult.sharpe_ratio ?? 0).toFixed(2)}</span>
+            ) : (
+              <div className="empty-placeholder">
+                Enter ticker(s), set strategy and params, then click Run strategy
               </div>
-              <div className="stat">
-                <span className="label">Max Drawdown</span>
-                <span className="value negative">{formatPercent(backtestResult.max_drawdown ?? 0)}</span>
+            )}
+            {backtestResult && (backtestResult.total_return !== undefined || backtestResult.equity_curve) && (
+              <div style={{ marginTop: '1rem' }}>
+                <button
+                  type="button"
+                  onClick={() => fetchMonteCarlo(backtestResult.ticker, backtestResult.strategy || strategySelect)}
+                  disabled={monteCarloLoading}
+                  style={{
+                    padding: '10px 20px',
+                    background: '#2E86AB',
+                    color: 'white',
+                    border: 'none',
+                    borderRadius: '8px',
+                    cursor: 'pointer',
+                    fontSize: '14px',
+                    fontWeight: '600',
+                  }}
+                >
+                  {monteCarloLoading ? 'Running…' : 'Run Monte Carlo Simulation'}
+                </button>
+                {monteCarloError && <span className="backtest-error" style={{ display: 'block', marginTop: '0.5rem' }}>{monteCarloError}</span>}
               </div>
-              <div className="stat">
-                <span className="label">Number of Trades</span>
-                <span className="value">{backtestResult.num_trades ?? 0}</span>
-              </div>
-            </div>
-          ) : (
-            <div className="empty-placeholder">
-              Enter ticker(s), set strategy and params, then click Run strategy
-            </div>
-          )}
+            )}
+          </div>
         </div>
 
         {/* Comparison */}
@@ -600,6 +664,72 @@ function App() {
               </div>
             </div>
             <p className="comparison-note">Gap reflects execution costs, slippage, and timing.</p>
+          </div>
+        )}
+
+        {showMonteCarlo && monteCarloData && !monteCarloData.error && (
+          <div className="card chart-card monte-carlo-card">
+            <h2>Monte Carlo Simulation (10,000 runs)</h2>
+            <div className="stats monte-carlo-stats">
+              <div className="stat">
+                <span className="label">5th Percentile (worst case)</span>
+                <span className={`value ${(monteCarloData.percentiles?.[5] ?? 0) < (monteCarloData.percentiles?.[50] ?? 0) ? 'negative' : ''}`}>
+                  {formatCurrency(monteCarloData.percentiles?.[5] ?? 0)}
+                </span>
+              </div>
+              <div className="stat">
+                <span className="label">50th Percentile (median)</span>
+                <span className="value">
+                  {formatCurrency(monteCarloData.percentiles?.[50] ?? 0)}
+                </span>
+              </div>
+              <div className="stat">
+                <span className="label">95th Percentile (best case)</span>
+                <span className="value positive">
+                  {formatCurrency(monteCarloData.percentiles?.[95] ?? 0)}
+                </span>
+              </div>
+              <div className="stat">
+                <span className="label">Probability of Profit</span>
+                <span className="value">
+                  {((monteCarloData.probability_profit ?? 0) * 100).toFixed(1)}%
+                </span>
+              </div>
+            </div>
+            {monteCarloData.histogram_data && monteCarloData.histogram_data.length > 0 && (() => {
+              const mean = monteCarloData.mean ?? 0;
+              const std = monteCarloData.std || 1;
+              const normalPDF = (x) => (1 / (std * Math.sqrt(2 * Math.PI))) * Math.exp(-0.5 * Math.pow((x - mean) / std, 2));
+              const bins = monteCarloData.histogram_data.map((d) => d.bin);
+              const maxCount = Math.max(...monteCarloData.histogram_data.map((d) => d.count));
+              const densities = bins.map(normalPDF);
+              const maxDensity = Math.max(...densities);
+              const scale = maxDensity > 0 ? maxCount / maxDensity : 0;
+              const chartData = monteCarloData.histogram_data.map((d, i) => ({
+                ...d,
+                normalCurve: scale * normalPDF(d.bin),
+              }));
+              return (
+                <ResponsiveContainer width="100%" height={280}>
+                  <ComposedChart data={chartData} margin={{ top: 8, right: 8, bottom: 8, left: 8 }}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
+                    <XAxis
+                      dataKey="bin"
+                      tickFormatter={(value) => `$${(value / 1000).toFixed(0)}k`}
+                      stroke="#94a3b8"
+                    />
+                    <YAxis stroke="#94a3b8" />
+                    <Tooltip
+                      formatter={(value, name) => [name === 'normalCurve' ? value.toFixed(0) + ' (fit)' : value, name === 'normalCurve' ? 'Normal curve' : 'Count']}
+                      labelFormatter={(label) => `Portfolio Value: ${formatCurrency(label)}`}
+                    />
+                    <Legend />
+                    <Bar dataKey="count" fill="#2E86AB" name="Simulations" radius={[2, 2, 0, 0]} />
+                    <Line type="monotone" dataKey="normalCurve" stroke="#f59e0b" strokeWidth={2} dot={false} name="Normal fit" />
+                  </ComposedChart>
+                </ResponsiveContainer>
+              );
+            })()}
           </div>
         )}
 

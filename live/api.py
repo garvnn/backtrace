@@ -14,6 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from database import Database
 import json
+import pandas as pd
 
 app = FastAPI()
 
@@ -299,6 +300,40 @@ def get_backtest_results(ticker: str = None, strategy: str = None):
     for r in results:
         r["equity_curve"] = _downsample_equity_curve(r.get("equity_curve") or [])
     return {"results": results}
+
+
+@app.get("/monte-carlo")
+def get_monte_carlo(ticker: str, strategy: str = "Momentum", runs: int = 10000):
+    """
+    Run Monte Carlo simulation on backtest results.
+    Uses saved backtest equity curve; run a backtest first for the given ticker and strategy.
+    """
+    from analytics.monte_carlo import run_monte_carlo
+
+    normalized_strategy = "MeanReversion" if strategy == "MA Crossover" else strategy
+    results = db.get_backtest_results(ticker=ticker.strip().upper(), strategy=normalized_strategy)
+
+    if not results:
+        return {"error": "No backtest results found. Run backtest first."}
+
+    equity_curve = results[0].get("equity_curve") or []
+    if len(equity_curve) < 2:
+        raise HTTPException(
+            status_code=422,
+            detail="Equity curve has too few points for Monte Carlo (need at least 2).",
+        )
+
+    portfolio_values = pd.Series([x["portfolio_value"] for x in equity_curve])
+    initial_capital = float(equity_curve[0]["portfolio_value"]) if equity_curve else 100000.0
+
+    mc_results = run_monte_carlo(
+        portfolio_values, num_simulations=runs, initial_capital=initial_capital
+    )
+
+    if "error" in mc_results:
+        raise HTTPException(status_code=422, detail=mc_results["error"])
+
+    return mc_results
 
 
 class RunExecutorRequest(BaseModel):
