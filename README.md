@@ -40,6 +40,30 @@ python strategies/mean_reversion.py
 python analytics/metrics.py
 ```
 
+## BackTrace Live / Scheduler
+
+The **live** module runs strategies against Alpaca (paper trading) and can be automated with the daily scheduler.
+
+### Running the scheduler
+
+From the project root:
+
+```bash
+python live/scheduler.py
+```
+
+Or from the `live/` directory:
+
+```bash
+cd live && python scheduler.py
+```
+
+- **What it does:** Every weekday at **4:30 PM ET** (after US market close), the scheduler runs Momentum and MA Crossover on the top 10 SPY tickers (AAPL, MSFT, NVDA, GOOGL, AMZN, META, TSLA, BRK.B, UNH, XOM), then runs Stat Arb on configured pairs. Each run fetches data, generates signals, and places trades via Alpaca; orders fill the next morning at market open. Logs are written to `live/scheduler.log` and to the console.
+- **How to stop:** Press **Ctrl+C** in the terminal where the scheduler is running.
+- **Deployment:** Keep the process running in the background with a process manager (e.g. **systemd**, **screen**, **tmux**) or a PaaS (e.g. **Railway**). Ensure the server timezone or cron is set for Eastern Time so the 4:30 PM ET run is correct.
+
+To test without waiting for 4:30 PM, uncomment the optional test job in `live/scheduler.py` (runs once 1 minute after start), then comment it back out for production.
+
 ## Project Structure
 ```
 backtrace/

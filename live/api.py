@@ -13,8 +13,12 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from database import Database
+from pairs_config import get_available_pairs, is_valid_pair
 import json
+from datetime import datetime, timezone
 import pandas as pd
+from dotenv import load_dotenv
+load_dotenv(os.path.join(LIVE_DIR, ".env"))
 
 app = FastAPI()
 
@@ -50,22 +54,84 @@ def read_root():
 
 @app.get("/portfolio")
 def get_portfolio():
-    """Get current portfolio state."""
+    """Get current portfolio state. Single source of truth for Dashboard and Portfolio tabs."""
     history = db.get_portfolio_history()
     
     if not history:
-        return {"portfolio_value": 0, "cash": 0, "positions": {}}
+        return {
+            "portfolio_value": 0,
+            "cash": 0,
+            "positions": {},
+            "timestamp": None,
+            "strategy": None,
+        }
     
     # Get latest snapshot
     latest = history[-1]
+    positions_raw = latest[5]
+    positions = json.loads(positions_raw) if positions_raw else {}
     
     return {
-        "portfolio_value": latest[3],
-        "cash": latest[4],
-        "positions": json.loads(latest[5]),
+        "portfolio_value": float(latest[3]),
+        "cash": float(latest[4]),
+        "positions": positions,
         "timestamp": latest[1],
-        "strategy": latest[2]
+        "strategy": latest[2],
     }
+
+
+@app.get("/positions-detail")
+def get_positions_detail():
+    """
+    Live position details from Alpaca: entry price, current price, P&L, P&L%.
+    For Current Portfolio tab. Returns empty positions if Alpaca keys missing or error.
+    """
+    api_key = os.getenv("ALPACA_API_KEY")
+    secret_key = os.getenv("ALPACA_SECRET_KEY")
+    if not api_key or not secret_key:
+        return {
+            "portfolio_value": 0,
+            "cash": 0,
+            "positions": [],
+            "timestamp": None,
+        }
+    try:
+        from alpaca.trading.client import TradingClient
+        client = TradingClient(api_key, secret_key, paper=True)
+        account = client.get_account()
+        positions = client.get_all_positions()
+        out = []
+        for pos in positions:
+            qty = float(pos.qty)
+            if qty == 0:
+                continue
+            entry_price = float(pos.avg_entry_price or 0) if hasattr(pos, "avg_entry_price") else (float(pos.cost_basis or 0) / abs(qty) if qty else 0)
+            current_price = float(pos.current_price or 0) if hasattr(pos, "current_price") else (float(pos.market_value or 0) / abs(qty) if qty else 0)
+            unrealized_pl = float(pos.unrealized_pl or 0) if hasattr(pos, "unrealized_pl") else (current_price - entry_price) * qty
+            cost_basis = float(pos.cost_basis or 0) or (entry_price * abs(qty))
+            unrealized_plpc = float(pos.unrealized_plpc or 0) if hasattr(pos, "unrealized_plpc") else (unrealized_pl / cost_basis if cost_basis else 0)
+            out.append({
+                "symbol": pos.symbol,
+                "qty": qty,
+                "entry_price": entry_price,
+                "current_price": current_price,
+                "pnl": unrealized_pl,
+                "pnl_pct": unrealized_plpc,
+            })
+        return {
+            "portfolio_value": float(account.portfolio_value or 0),
+            "cash": float(account.cash or 0),
+            "positions": out,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+    except Exception as e:
+        return {
+            "portfolio_value": 0,
+            "cash": 0,
+            "positions": [],
+            "timestamp": None,
+            "error": str(e),
+        }
 
 
 @app.get("/trades")
@@ -73,6 +139,13 @@ def get_trades(strategy: str = None):
     """Get all trades, optionally filtered by strategy. Each trade includes params if stored."""
     trades = db.get_all_trades(strategy=strategy)
     return {"trades": trades}
+
+
+@app.get("/available-pairs/{ticker}")
+def get_pairs_for_ticker(ticker: str):
+    """Get list of valid pairs for a ticker."""
+    pairs = get_available_pairs(ticker.upper())
+    return {"ticker": ticker.upper(), "available_pairs": pairs}
 
 
 @app.get("/pairs")
@@ -208,6 +281,11 @@ def run_backtest(req: BacktestRequest):
         ticker_b = (req.ticker_b or "").strip().upper()
         if not ticker_b:
             raise HTTPException(status_code=400, detail="Stat Arb requires ticker_b")
+        if not is_valid_pair(ticker, ticker_b):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid pair: {ticker}-{ticker_b}. Use preset pairs from the dropdown.",
+            )
         pair_ticker = f"{ticker}-{ticker_b}"
     old_cwd = os.getcwd()
     try:
@@ -367,6 +445,11 @@ def run_executor(req: RunExecutorRequest = None):
             ticker_b = req.ticker_b.strip().upper()
         if not ticker_b:
             raise HTTPException(status_code=400, detail="Stat Arb requires ticker_b or pair_name (e.g. AAPL-MSFT)")
+        if not is_valid_pair(ticker_a, ticker_b):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid pair: {ticker_a}-{ticker_b}. Use preset pairs from the dropdown.",
+            )
     old_cwd = os.getcwd()
     try:
         os.chdir(LIVE_DIR)

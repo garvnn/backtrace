@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { LineChart, Line, BarChart, Bar, ComposedChart, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
+import { LineChart, Line, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
 import './App.css';
 
 const API_BASE = 'http://localhost:8000';
@@ -24,6 +24,9 @@ function App() {
   const [pairs, setPairs] = useState([]);
   const [pairTrades, setPairTrades] = useState([]);
   const [tickerB, setTickerB] = useState('MSFT');
+  const [statArbTicker1, setStatArbTicker1] = useState('AAPL');
+  const [availablePairs, setAvailablePairs] = useState(['MSFT', 'GOOGL', 'META']);
+  const [statArbTicker2, setStatArbTicker2] = useState('MSFT');
   const [statArbLookback, setStatArbLookback] = useState(60);
   const [statArbEntry, setStatArbEntry] = useState(2);
   const [statArbExit, setStatArbExit] = useState(0.5);
@@ -31,11 +34,16 @@ function App() {
   const [showMonteCarlo, setShowMonteCarlo] = useState(false);
   const [monteCarloLoading, setMonteCarloLoading] = useState(false);
   const [monteCarloError, setMonteCarloError] = useState(null);
+  const [tickerFilter, setTickerFilter] = useState('');
+  const [activeTab, setActiveTab] = useState('Dashboard');
+  const [chartRange, setChartRange] = useState('All'); // '1M' | '3M' | '6M' | '1Y' | 'All'
+  const [strategyHelpOpen, setStrategyHelpOpen] = useState(false);
+  const [positionsSort, setPositionsSort] = useState('pnl'); // 'pnl' | 'ticker'
   const shortMaRef = useRef(null);
   const longMaRef = useRef(null);
   const lookbackRef = useRef(null);
   const strategyFormRef = useRef(null);
-  const paramsForRunRef = useRef({ strategy: 'Momentum', shortMa: 50, longMa: 200, lookbackPeriod: 120, tickerB: 'MSFT', statArbLookback: 60, statArbEntry: 2, statArbExit: 0.5 });
+  const paramsForRunRef = useRef({ strategy: 'Momentum', shortMa: 50, longMa: 200, lookbackPeriod: 120, tickerB: 'MSFT', statArbTicker1: 'AAPL', statArbTicker2: 'MSFT', statArbLookback: 60, statArbEntry: 2, statArbExit: 0.5 });
   useEffect(() => {
     paramsForRunRef.current = {
       strategy: strategySelect,
@@ -43,11 +51,13 @@ function App() {
       longMa,
       lookbackPeriod,
       tickerB,
+      statArbTicker1,
+      statArbTicker2,
       statArbLookback,
       statArbEntry,
       statArbExit,
     };
-  }, [strategySelect, shortMa, longMa, lookbackPeriod, tickerB, statArbLookback, statArbEntry, statArbExit]);
+  }, [strategySelect, shortMa, longMa, lookbackPeriod, tickerB, statArbTicker1, statArbTicker2, statArbLookback, statArbEntry, statArbExit]);
 
   useEffect(() => {
     fetchData();
@@ -109,6 +119,115 @@ function App() {
     return (value * 100).toFixed(2) + '%';
   };
 
+  const formatPercentSigned = (value) => {
+    const pct = (value * 100).toFixed(2);
+    const sign = value >= 0 ? '+' : '';
+    return sign + pct + '%';
+  };
+
+  const timeAgo = (isoString) => {
+    if (!isoString) return '';
+    const d = new Date(isoString);
+    const now = new Date();
+    const sec = Math.floor((now - d) / 1000);
+    if (sec < 60) return 'Just now';
+    if (sec < 3600) return `${Math.floor(sec / 60)} min ago`;
+    if (sec < 86400) return `${Math.floor(sec / 3600)} hrs ago`;
+    if (sec < 604800) return `${Math.floor(sec / 86400)} days ago`;
+    return d.toLocaleDateString();
+  };
+
+  // Compute live Sharpe and max drawdown from portfolio history (client-side)
+  const computeSharpe = (hist) => {
+    if (!hist || hist.length < 2) return null;
+    const values = hist.map((h) => h.portfolio_value).filter((v) => v != null && v > 0);
+    if (values.length < 2) return null;
+    const returns = [];
+    for (let i = 1; i < values.length; i++) {
+      returns.push((values[i] - values[i - 1]) / values[i - 1]);
+    }
+    const mean = returns.reduce((a, b) => a + b, 0) / returns.length;
+    const variance = returns.reduce((a, r) => a + (r - mean) ** 2, 0) / returns.length;
+    const std = Math.sqrt(variance);
+    if (std === 0) return 0;
+    const annualized = mean * 252;
+    const stdAnnual = std * Math.sqrt(252);
+    return stdAnnual === 0 ? 0 : annualized / stdAnnual;
+  };
+
+  const computeMaxDrawdown = (hist) => {
+    if (!hist || hist.length < 2) return null;
+    const values = hist.map((h) => h.portfolio_value).filter((v) => v != null);
+    if (values.length < 2) return null;
+    let peak = values[0];
+    let maxDd = 0;
+    for (let i = 1; i < values.length; i++) {
+      if (values[i] > peak) peak = values[i];
+      const dd = (peak - values[i]) / peak;
+      if (dd > maxDd) maxDd = dd;
+    }
+    return -maxDd; // negative as convention
+  };
+
+  const handleStatArbTicker1Change = async (e) => {
+    const ticker = e.target.value.toUpperCase();
+    setStatArbTicker1(ticker);
+    setTickerInput(ticker);
+    if (ticker.length >= 2) {
+      try {
+        const res = await fetch(`${API_BASE}/available-pairs/${ticker}`);
+        const data = await res.json();
+        setAvailablePairs(data.available_pairs || []);
+        if (!(data.available_pairs || []).includes(statArbTicker2)) {
+          setStatArbTicker2('');
+          setTickerB('');
+          paramsForRunRef.current.tickerB = '';
+        }
+      } catch {
+        setAvailablePairs([]);
+      }
+    } else {
+      setAvailablePairs([]);
+    }
+  };
+
+  const handleStatArbTicker2Change = (e) => {
+    const v = e.target.value;
+    setStatArbTicker2(v);
+    setTickerB(v);
+    paramsForRunRef.current.tickerB = v;
+  };
+
+  const ZScoreGauge = ({ zScore }) => {
+    const z = zScore != null ? Number(zScore) : 0;
+    const getColor = (val) => {
+      if (Math.abs(val) > 2) return '#ef4444';
+      if (Math.abs(val) > 1) return '#f59e0b';
+      return '#22c55e';
+    };
+    const pct = Math.max(0, Math.min(100, ((z + 3) / 6) * 100));
+    return (
+      <div className="z-gauge">
+        <div className="z-bar">
+          <div
+            className="z-marker"
+            style={{ left: `${pct}%`, background: getColor(z) }}
+          />
+        </div>
+        <div className="z-labels">
+          <span>-3</span>
+          <span>-2</span>
+          <span>0</span>
+          <span>+2</span>
+          <span>+3</span>
+        </div>
+        <div className="z-value">
+          Current Z-Score: <strong>{z.toFixed(2)}</strong>
+        </div>
+      </div>
+    );
+  };
+
   // Store only fields needed for UI to avoid DataCloneError when state is cloned (e.g. by DevTools/profiling)
   // sentParams: for Stat Arb, merge in so display always shows what we sent (API can omit keys)
   const setBacktestResultMinimal = (data, sentParams = null) => {
@@ -140,13 +259,11 @@ function App() {
   };
 
   const runStrategy = async () => {
-    const ticker = tickerInput.trim().toUpperCase();
-    if (!ticker) return;
-
     await new Promise((r) => setTimeout(r, 0));
-    // Read from ref so we send the values currently in the form (ref is updated synchronously in onChange; state can be stale if user clicks Run before re-render)
-    const { strategy, shortMa, longMa, lookbackPeriod, tickerB: refTickerB, statArbLookback: refLookback, statArbEntry: refEntry, statArbExit: refExit } = paramsForRunRef.current;
-    const tickerBVal = (strategy === 'Stat Arb' ? (refTickerB || '').trim().toUpperCase() : '');
+    const { strategy, shortMa, longMa, lookbackPeriod, tickerB: refTickerB, statArbTicker1: refT1, statArbTicker2: refT2, statArbLookback: refLookback, statArbEntry: refEntry, statArbExit: refExit } = paramsForRunRef.current;
+    const ticker = strategy === 'Stat Arb' ? (refT1 || '').trim().toUpperCase() : tickerInput.trim().toUpperCase();
+    if (!ticker) return;
+    const tickerBVal = (strategy === 'Stat Arb' ? (refT2 || refTickerB || '').trim().toUpperCase() : '');
     const statArbLookbackVal = strategy === 'Stat Arb' ? (Number(refLookback) || 60) : 60;
     const statArbEntryVal = strategy === 'Stat Arb' ? (Number(refEntry) || 2) : 2;
     const statArbExitVal = strategy === 'Stat Arb' ? (Number(refExit) || 0.5) : 0.5;
@@ -248,9 +365,9 @@ function App() {
 
   const placeTrade = async () => {
     await new Promise((r) => setTimeout(r, 0));
-    const { strategy, shortMa, longMa, lookbackPeriod, tickerB: tb, statArbLookback: sal, statArbEntry: sae, statArbExit: sax } = paramsForRunRef.current;
-    const ticker = tickerInput.trim().toUpperCase() || 'AAPL';
-    const tickerBVal = (tb || '').trim().toUpperCase();
+    const { strategy, shortMa, longMa, lookbackPeriod, tickerB: tb, statArbTicker1: refT1, statArbTicker2: refT2, statArbLookback: sal, statArbEntry: sae, statArbExit: sax } = paramsForRunRef.current;
+    const ticker = (strategy === 'Stat Arb' ? (refT1 || '').trim().toUpperCase() : tickerInput.trim().toUpperCase()) || 'AAPL';
+    const tickerBVal = (strategy === 'Stat Arb' ? (refT2 || tb || '') : tb || '').trim().toUpperCase();
     setExecutorError(null);
     setPlaceTradeLoading(true);
     try {
@@ -304,7 +421,7 @@ function App() {
   };
 
   // Combined chart data: live + backtest (backtest scaled to same start as live)
-  const chartData = (() => {
+  const chartDataFull = (() => {
     const backtestCurve = backtestResult?.equity_curve || [];
     const liveStart = history.length > 0 ? history[0].portfolio_value : 100000;
     const liveByDate = {};
@@ -322,533 +439,539 @@ function App() {
     }));
   })();
 
+  const chartData = (() => {
+    if (!chartRange || chartRange === 'All') return chartDataFull;
+    const now = new Date();
+    let cut = new Date(now);
+    if (chartRange === '1M') cut.setMonth(cut.getMonth() - 1);
+    else if (chartRange === '3M') cut.setMonth(cut.getMonth() - 3);
+    else if (chartRange === '6M') cut.setMonth(cut.getMonth() - 6);
+    else if (chartRange === '1Y') cut.setFullYear(cut.getFullYear() - 1);
+    const cutStr = cut.toISOString().slice(0, 10);
+    return chartDataFull.filter((d) => (d.timestamp || '') >= cutStr);
+  })();
+
+  const liveSharpe = computeSharpe(history);
+  const liveMaxDrawdown = computeMaxDrawdown(history);
+  const daysRunning = history.length >= 1 && history[0].timestamp
+    ? Math.max(0, Math.floor((Date.now() - new Date(history[0].timestamp).getTime()) / 86400000))
+    : null;
+  const recentTrades = trades.slice(0, 5);
+  // Single source: GET /portfolio. Positions from portfolio.positions (object or array).
+  const positionsFromPortfolio = (() => {
+    const p = portfolio?.positions;
+    if (!p) return [];
+    if (Array.isArray(p)) return p.map((x) => ({ symbol: x.symbol || x.ticker, qty: Number(x.qty ?? x.quantity ?? 0) }));
+    return Object.entries(p).map(([symbol, qty]) => ({ symbol, qty: Number(qty) }));
+  })();
+  const positionsCount = positionsFromPortfolio.length;
+
+  const tabs = [
+    { id: 'Dashboard', label: 'Dashboard' },
+    { id: 'Portfolio', label: 'Portfolio' },
+    { id: 'Trades', label: 'Trades' },
+    { id: 'Backtest', label: 'Backtest' },
+  ];
+
+  useEffect(() => {
+    const val = portfolio?.portfolio_value ?? performance?.current_value;
+    if (val != null) {
+      document.title = `BackTrace Live | ${formatCurrency(val)}`;
+    }
+    return () => { document.title = 'BackTrace Live'; };
+  }, [portfolio?.portfolio_value, performance?.current_value]);
+
   return (
     <div className="App">
       <header>
-        <h1>BackTrace Live</h1>
-        <p>Backtest vs Reality</p>
-        <div className="strategy-controls" ref={strategyFormRef}>
-          <label className="strategy-label">Strategy</label>
-          <select
-            value={strategySelect}
-            onChange={(e) => {
-              const v = e.target.value;
-              setStrategySelect(v);
-              paramsForRunRef.current.strategy = v;
-            }}
-            className="strategy-select"
-            disabled={runLoading || placeTradeLoading}
-          >
-            <option value="Momentum">Momentum</option>
-            <option value="MA Crossover">MA Crossover</option>
-            <option value="Stat Arb">Stat Arb</option>
-          </select>
-          {strategySelect === 'Stat Arb' && (
-            <>
-              <label className="param-label">Ticker B</label>
-              <input
-                type="text"
-                value={tickerB}
-                onChange={(e) => { setTickerB(e.target.value); paramsForRunRef.current.tickerB = e.target.value; }}
-                placeholder="e.g. MSFT"
-                className="param-input"
-              />
-              <label className="param-label">Lookback (days)</label>
-              <input
-                type="number"
-                min={10}
-                max={252}
-                value={statArbLookback}
-                onChange={(e) => { const v = Number(e.target.value) || 60; setStatArbLookback(v); paramsForRunRef.current.statArbLookback = v; }}
-                className="param-input"
-              />
-              <label className="param-label">Entry z</label>
-              <input
-                type="number"
-                min={0.5}
-                step={0.1}
-                value={statArbEntry}
-                onChange={(e) => { const v = Number(e.target.value) || 2; setStatArbEntry(v); paramsForRunRef.current.statArbEntry = v; }}
-                className="param-input"
-              />
-              <label className="param-label">Exit z</label>
-              <input
-                type="number"
-                min={0}
-                step={0.1}
-                value={statArbExit}
-                onChange={(e) => { const v = Number(e.target.value) || 0.5; setStatArbExit(v); paramsForRunRef.current.statArbExit = v; }}
-                className="param-input"
-              />
-            </>
-          )}
-          {strategySelect === 'MA Crossover' && (
-            <>
-              <label className="param-label">Short MA (days)</label>
-              <input
-                ref={shortMaRef}
-                name="short_window"
-                type="number"
-                min={1}
-                max={500}
-                value={shortMa}
-                onChange={(e) => {
-                  const v = Number(e.target.value) || 50;
-                  setShortMa(v);
-                  paramsForRunRef.current.shortMa = v;
-                }}
-                className="param-input"
-              />
-              <label className="param-label">Long MA (days)</label>
-              <input
-                ref={longMaRef}
-                name="long_window"
-                type="number"
-                min={1}
-                max={500}
-                value={longMa}
-                onChange={(e) => {
-                  const v = Number(e.target.value) || 200;
-                  setLongMa(v);
-                  paramsForRunRef.current.longMa = v;
-                }}
-                className="param-input"
-              />
-            </>
-          )}
-          {strategySelect === 'Momentum' && (
-            <>
-              <label className="param-label">Lookback (days)</label>
-              <input
-                ref={lookbackRef}
-                name="lookback_period"
-                type="number"
-                min={1}
-                max={500}
-                value={lookbackPeriod}
-                onChange={(e) => {
-                  const v = Number(e.target.value) || 120;
-                  setLookbackPeriod(v);
-                  paramsForRunRef.current.lookbackPeriod = v;
-                }}
-                className="param-input"
-              />
-            </>
-          )}
-        </div>
-        <div className="ticker-load">
-          <input
-            type="text"
-            value={tickerInput}
-            onChange={(e) => setTickerInput(e.target.value)}
-            placeholder={strategySelect === 'Stat Arb' ? 'Ticker A e.g. AAPL' : 'e.g. AAPL'}
-            className="ticker-input"
-            disabled={runLoading || placeTradeLoading}
-          />
-          <button
-            type="button"
-            onClick={runStrategy}
-            disabled={runLoading || placeTradeLoading || !tickerInput.trim()}
-            className="run-strategy-btn"
-          >
-            {runLoading ? 'Running…' : 'Run strategy'}
-          </button>
-          <button
-            type="button"
-            onClick={placeTrade}
-            disabled={runLoading || placeTradeLoading || !tickerInput.trim() || (strategySelect === 'Stat Arb' && !tickerB.trim())}
-            className="place-trade-btn"
-          >
-            {placeTradeLoading ? 'Placing…' : 'Place trade'}
-          </button>
-          {backtestError && <span className="backtest-error">{backtestError}</span>}
-          {executorError && <span className="backtest-error">{executorError}</span>}
-        </div>
+        <div className="header-brand">BackTrace Live</div>
+        <nav className="header-tabs">
+          {tabs.map((tab) => (
+            <button
+              key={tab.id}
+              type="button"
+              className={`tab-btn ${activeTab === tab.id ? 'tab-btn-active' : ''}`}
+              onClick={() => { fetchData(); setActiveTab(tab.id); }}
+            >
+              {tab.label}
+            </button>
+          ))}
+        </nav>
+        <div className="header-right" aria-hidden="true" />
       </header>
 
       {error && (
         <div className="error-banner">
-          Unable to load data. Retrying in 60s.
+          <span>Unable to load data. Retrying in 60s.</span>
+          <button type="button" onClick={fetchData} style={{ padding: '0.35rem 0.75rem', background: 'rgba(255,255,255,0.15)', border: 'none', borderRadius: 6, color: '#fecaca', cursor: 'pointer' }}>Retry</button>
         </div>
       )}
 
       <div className="container">
-        <div className="card strategy-help chart-card">
-          <h2>How the strategies work</h2>
-          {strategySelect === 'Stat Arb' ? (
-            <div className="help-content">
-              <p><strong>Stat Arb (statistical arbitrage / pairs trading)</strong></p>
-              <p>Trade two <strong>cointegrated</strong> stocks (e.g. AAPL/MSFT, KO/PEP). The spread is log(price_A) − β·log(price_B). When the spread&apos;s <strong>z-score</strong> exceeds the entry threshold, the strategy goes short the spread (sell A, buy B); when z-score is below −entry, it goes long (buy A, sell B). It closes when |z| &lt; exit threshold.</p>
-              <p><strong>Lookback</strong> is the window (days) for spread mean/std. <strong>Entry z</strong> and <strong>Exit z</strong> control when to open and close. Use <code>live/pairs_finder.py</code> to discover cointegrated pairs.</p>
-            </div>
-          ) : strategySelect === 'MA Crossover' ? (
-            <div className="help-content">
-              <p><strong>MA Crossover (moving average crossover)</strong></p>
-              <p><strong>Short MA</strong> and <strong>Long MA</strong> are the number of trading days used to compute two moving averages of the stock&apos;s closing price. The short MA reacts faster to recent prices; the long MA is smoother.</p>
-              <p><strong>Buy:</strong> when the short MA crosses above the long MA (short &gt; long). That often means recent momentum is turning up. <strong>Sell:</strong> when the short MA crosses below the long MA (short &lt; long).</p>
-              <p>Example: 50/200 means buy when the 50-day average is above the 200-day average. Smaller short (e.g. 20) gives more frequent signals; larger short (e.g. 100) gives fewer, slower signals.</p>
-            </div>
-          ) : (
-            <div className="help-content">
-              <p><strong>Momentum</strong></p>
-              <p>The strategy looks at the stock&apos;s <strong>total return over the last N days</strong> (the lookback). If that return is positive, it goes long; if negative, it goes to cash.</p>
-              <p><strong>Lookback (days)</strong> is that N: e.g. 120 ≈ 6 months of trading days. Shorter lookback (e.g. 30) reacts faster to recent performance but can whipsaw. Longer lookback (e.g. 252 ≈ 1 year) trades less often and follows longer-term trend.</p>
-            </div>
-          )}
-        </div>
-        {/* Portfolio Summary */}
-        <div className="card">
-          <h2>Current Portfolio</h2>
-          {loading && !portfolio ? (
-            <div className="loading-placeholder">Loading...</div>
-          ) : portfolio ? (
-            <div className="stats">
-              {strategySelect === 'Stat Arb' && pairs.length > 0 ? (
-                <>
-                  <div className="stat">
-                    <span className="label">Positions</span>
-                    <span className="value" style={{ display: 'block' }}>
-                      {pairs.map((p, i) => (
-                        <span key={i}>
-                          {p.ticker_a}: {p.qty_a} shares · {p.ticker_b}: {p.qty_b} shares
-                        </span>
-                      ))}
-                    </span>
+        {activeTab === 'Portfolio' && (
+          <div className="card portfolio-tab-card">
+            <h2>Current Portfolio</h2>
+            {portfolio != null && (
+              <>
+                <div className="portfolio-tab-summary">
+                  <div className="portfolio-tab-value">
+                    <span className="label">Portfolio Value</span>
+                    <span className="value">{formatCurrency(portfolio.portfolio_value ?? 0)}</span>
                   </div>
-                  <div className="stat">
-                    <span className="label">Combined Value</span>
-                    <span className="value">{formatCurrency(pairs[0].combined_value)}</span>
+                  <div className="portfolio-tab-cash">
+                    <span className="label">Cash</span>
+                    <span className="value">{formatCurrency(portfolio.cash ?? 0)}</span>
+                  </div>
+                </div>
+                {portfolio.timestamp && (
+                  <p className="portfolio-last-update">Last updated: {timeAgo(portfolio.timestamp)}</p>
+                )}
+                <div className="positions-table-wrap">
+                  <div className="positions-sort">
+                    <span>Sort by:</span>
+                    <button type="button" className={positionsSort === 'ticker' ? 'active' : ''} onClick={() => setPositionsSort('ticker')}>Ticker</button>
+                    <button type="button" className={positionsSort === 'pnl' ? 'active' : ''} onClick={() => setPositionsSort('pnl')}>P&L</button>
+                  </div>
+                  <table className="positions-detail-table">
+                    <thead>
+                      <tr>
+                        <th>Ticker</th>
+                        <th>Qty</th>
+                        <th>Entry Price</th>
+                        <th>Current Price</th>
+                        <th>P&L</th>
+                        <th>P&L %</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {[...positionsFromPortfolio]
+                        .sort((a, b) => positionsSort === 'ticker'
+                          ? (a.symbol || '').localeCompare(b.symbol || '')
+                          : (b.pnl ?? 0) - (a.pnl ?? 0))
+                        .map((row) => (
+                          <tr key={row.symbol}>
+                            <td><strong>{row.symbol}</strong></td>
+                            <td>{row.qty}</td>
+                            <td>{row.entry_price != null ? formatCurrency(row.entry_price) : '—'}</td>
+                            <td>{row.current_price != null ? formatCurrency(row.current_price) : '—'}</td>
+                            <td className={(row.pnl ?? 0) >= 0 ? 'positive' : 'negative'}>{row.pnl != null ? formatCurrency(row.pnl) : '—'}</td>
+                            <td className={(row.pnl_pct ?? 0) >= 0 ? 'positive' : 'negative'}>{row.pnl_pct != null ? formatPercent(row.pnl_pct) : '—'}</td>
+                          </tr>
+                        ))}
+                    </tbody>
+                  </table>
+                  {positionsFromPortfolio.length === 0 && (
+                    <p className="empty-placeholder">No open positions.</p>
+                  )}
+                </div>
+              </>
+            )}
+            {portfolio == null && !loading && <p className="empty-placeholder">Unable to load portfolio.</p>}
+            {loading && portfolio == null && <div className="loading-placeholder">Loading…</div>}
+          </div>
+        )}
+
+        {activeTab === 'Trades' && (
+          <div className="card">
+            <h2>Trade History</h2>
+            {!(strategySelect === 'Stat Arb' && pairTrades.length > 0) && trades.length > 0 && (
+              <div className="trades-filter">
+                <label htmlFor="ticker-filter-th">Filter by ticker:</label>
+                <input id="ticker-filter-th" type="text" placeholder="All tickers" value={tickerFilter} onChange={(e) => setTickerFilter(e.target.value.trim())} className="ticker-filter-input" />
+              </div>
+            )}
+            <div className="trades-table">
+              {strategySelect === 'Stat Arb' && pairTrades.length > 0 ? (
+                <table>
+                  <thead><tr><th>Time</th><th>Strategy</th><th>Pair</th><th>Side A</th><th>Side B</th><th>Qty A</th><th>Qty B</th><th>Spread</th><th>Z-score</th></tr></thead>
+                  <tbody>
+                    {pairTrades.map((pt) => (
+                      <tr key={pt.id}>
+                        <td>{new Date(pt.timestamp).toLocaleString()}</td>
+                        <td>{pt.strategy ?? '—'}</td>
+                        <td>{pt.pair_name ?? `${pt.ticker_a}-${pt.ticker_b}`}</td>
+                        <td className={pt.side_a === 'BUY' ? 'buy' : 'sell'}>{pt.side_a}</td>
+                        <td className={pt.side_b === 'BUY' ? 'buy' : 'sell'}>{pt.side_b}</td>
+                        <td>{pt.qty_a}</td>
+                        <td>{pt.qty_b}</td>
+                        <td>{pt.spread != null ? Number(pt.spread).toFixed(4) : '—'}</td>
+                        <td>{pt.z_score != null ? Number(pt.z_score).toFixed(2) : '—'}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              ) : (
+                <table>
+                  <thead><tr><th>Time</th><th>Strategy</th><th>Params</th><th>Side</th><th>Ticker</th><th>Qty</th><th>Price</th><th>Status</th><th>Actions</th></tr></thead>
+                  <tbody>
+                    {(tickerFilter ? trades.filter((t) => (t.ticker || '').toUpperCase().includes(tickerFilter.toUpperCase())) : trades).map((trade) => (
+                      <tr key={trade.id}>
+                        <td>{new Date(trade.timestamp).toLocaleString()}</td>
+                        <td>{trade.strategy ?? '—'}</td>
+                        <td>{formatTradeParams(trade)}</td>
+                        <td className={trade.side === 'BUY' ? 'buy' : 'sell'}>{trade.side}</td>
+                        <td>{trade.ticker}</td>
+                        <td>{trade.qty}</td>
+                        <td>{trade.price ? formatCurrency(trade.price) : '-'}</td>
+                        <td>{trade.status}</td>
+                        <td><button type="button" className="delete-trade-btn" onClick={() => deleteTrade(trade.id)}>Delete</button></td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </div>
+            {loading && trades.length === 0 && pairTrades.length === 0 && <div className="loading-placeholder">Loading…</div>}
+            {!loading && trades.length === 0 && pairTrades.length === 0 && <p className="empty-placeholder">No trades yet — run your first backtest.</p>}
+          </div>
+        )}
+
+        {activeTab === 'Backtest' && (
+          <div className="backtest-tab">
+            <div className="card">
+              <h2>Run Backtest</h2>
+              <div className="backtest-form" ref={strategyFormRef}>
+                <label className="strategy-label">Strategy</label>
+                <select
+                  value={strategySelect}
+                  onChange={(e) => { const v = e.target.value; setStrategySelect(v); paramsForRunRef.current.strategy = v; }}
+                  className="strategy-select"
+                  disabled={runLoading || placeTradeLoading}
+                >
+                  <option value="Momentum">Momentum</option>
+                  <option value="MA Crossover">MA Crossover</option>
+                  <option value="Stat Arb">Stat Arb</option>
+                </select>
+                {strategySelect === 'Stat Arb' && (
+                  <>
+                    <div className="pair-selector">
+                      <div>
+                        <label className="param-label">First Stock</label>
+                        <input type="text" value={statArbTicker1} onChange={handleStatArbTicker1Change} placeholder="e.g. AAPL" className="param-input pair-input" />
+                      </div>
+                      <div>
+                        <label className="param-label">Paired With</label>
+                        <select value={statArbTicker2} onChange={handleStatArbTicker2Change} disabled={availablePairs.length === 0} className="strategy-select pair-select">
+                          <option value="">Select pair...</option>
+                          {availablePairs.map(t => (<option key={t} value={t}>{t}</option>))}
+                        </select>
+                      </div>
+                    </div>
+                    <label className="param-label">Lookback (days)</label>
+                    <input type="number" min={10} max={252} value={statArbLookback} onChange={(e) => { const v = Number(e.target.value) || 60; setStatArbLookback(v); paramsForRunRef.current.statArbLookback = v; }} className="param-input" />
+                    <label className="param-label">Entry z</label>
+                    <input type="number" min={0.5} step={0.1} value={statArbEntry} onChange={(e) => { const v = Number(e.target.value) || 2; setStatArbEntry(v); paramsForRunRef.current.statArbEntry = v; }} className="param-input" />
+                    <label className="param-label">Exit z</label>
+                    <input type="number" min={0} step={0.1} value={statArbExit} onChange={(e) => { const v = Number(e.target.value) || 0.5; setStatArbExit(v); paramsForRunRef.current.statArbExit = v; }} className="param-input" />
+                  </>
+                )}
+                {strategySelect === 'MA Crossover' && (
+                  <>
+                    <label className="param-label">Short MA (days)</label>
+                    <input ref={shortMaRef} type="number" min={1} max={500} value={shortMa} onChange={(e) => { const v = Number(e.target.value) || 50; setShortMa(v); paramsForRunRef.current.shortMa = v; }} className="param-input" />
+                    <label className="param-label">Long MA (days)</label>
+                    <input ref={longMaRef} type="number" min={1} max={500} value={longMa} onChange={(e) => { const v = Number(e.target.value) || 200; setLongMa(v); paramsForRunRef.current.longMa = v; }} className="param-input" />
+                  </>
+                )}
+                {strategySelect === 'Momentum' && (
+                  <>
+                    <label className="param-label">Lookback (days)</label>
+                    <input ref={lookbackRef} type="number" min={1} max={500} value={lookbackPeriod} onChange={(e) => { const v = Number(e.target.value) || 120; setLookbackPeriod(v); paramsForRunRef.current.lookbackPeriod = v; }} className="param-input" />
+                  </>
+                )}
+                {strategySelect !== 'Stat Arb' && (
+                  <input type="text" value={tickerInput} onChange={(e) => setTickerInput(e.target.value)} placeholder="e.g. AAPL" className="ticker-input" disabled={runLoading || placeTradeLoading} />
+                )}
+                <button type="button" onClick={runStrategy} disabled={runLoading || placeTradeLoading || (strategySelect === 'Stat Arb' ? (!statArbTicker1.trim() || !statArbTicker2.trim()) : !tickerInput.trim())} className="run-strategy-btn">
+                  {runLoading ? 'Running…' : 'Run Backtest'}
+                </button>
+                <button type="button" onClick={placeTrade} disabled={runLoading || placeTradeLoading || (strategySelect === 'Stat Arb' ? (!statArbTicker1.trim() || !statArbTicker2.trim()) : !tickerInput.trim())} className="place-trade-btn">
+                  {placeTradeLoading ? 'Placing…' : 'Place trade'}
+                </button>
+              </div>
+              {backtestError && <span className="backtest-error">{backtestError}</span>}
+              {executorError && <span className="backtest-error">{executorError}</span>}
+              {strategySelect === 'Stat Arb' && pairTrades.length > 0 && (
+                <div style={{ marginTop: '1rem' }}>
+                  <ZScoreGauge zScore={pairTrades[0]?.z_score ?? 0} />
+                </div>
+              )}
+            </div>
+            <div className="card">
+              <h2>Backtest Results {backtestResult?.ticker && `(${backtestResult.ticker})`}</h2>
+              {backtestResult && (backtestResult.total_return !== undefined || backtestResult.equity_curve) ? (
+                <div className="stats">
+                  {backtestResult.params_used && (
+                    <div className="stat params-used">
+                      <span className="label">Params used</span>
+                      <span className="value params-text">
+                        {backtestResult.params_used.strategy === 'Stat Arb' ? `${backtestResult.params_used.ticker_a ?? backtestResult.ticker?.split('-')[0] ?? '—'}-${backtestResult.params_used.ticker_b ?? backtestResult.ticker?.split('-')[1] ?? '—'}, lookback ${backtestResult.params_used.lookback ?? '—'}, entry z ${backtestResult.params_used.entry_threshold ?? '—'}, exit z ${backtestResult.params_used.exit_threshold ?? '—'}` : backtestResult.params_used.strategy === 'MeanReversion' ? `Short MA ${backtestResult.params_used.short_window ?? '—'}, Long MA ${backtestResult.params_used.long_window ?? '—'}` : `Lookback ${backtestResult.params_used.lookback_period ?? '—'} days`}
+                      </span>
+                    </div>
+                  )}
+                  <div className="stat"><span className="label">Total Return</span><span className={`value ${(backtestResult.total_return ?? 0) >= 0 ? 'positive' : 'negative'}`}>{formatPercent(backtestResult.total_return ?? 0)}</span></div>
+                  <div className="stat"><span className="label">Sharpe Ratio</span><span className="value">{Number(backtestResult.sharpe_ratio ?? 0).toFixed(2)}</span></div>
+                  <div className="stat"><span className="label">Max Drawdown</span><span className="value negative">{formatPercent(backtestResult.max_drawdown ?? 0)}</span></div>
+                  <div className="stat"><span className="label">Number of Trades</span><span className="value">{backtestResult.num_trades ?? 0}</span></div>
+                </div>
+              ) : (
+                <div className="empty-placeholder">Run a backtest above to see results.</div>
+              )}
+              {backtestResult && (backtestResult.total_return !== undefined || backtestResult.equity_curve) && (
+                <div style={{ marginTop: '1rem' }}>
+                  <button type="button" onClick={() => fetchMonteCarlo(backtestResult.ticker, backtestResult.strategy || strategySelect)} disabled={monteCarloLoading} className="run-strategy-btn" style={{ background: 'var(--accent)' }}>
+                    {monteCarloLoading ? 'Running…' : 'Run Monte Carlo Simulation'}
+                  </button>
+                  {monteCarloError && <span className="backtest-error" style={{ display: 'block', marginTop: '0.5rem' }}>{monteCarloError}</span>}
+                </div>
+              )}
+            </div>
+            {showMonteCarlo && monteCarloData && !monteCarloData.error && (
+              <div className="card chart-card monte-carlo-card">
+                <h2>Monte Carlo Simulation (10,000 runs)</h2>
+                <div className="stats monte-carlo-stats">
+                  <div className="stat"><span className="label">5th Percentile (worst case)</span><span className={`value ${(monteCarloData.percentiles?.[5] ?? 0) < (monteCarloData.percentiles?.[50] ?? 0) ? 'negative' : ''}`}>{formatCurrency(monteCarloData.percentiles?.[5] ?? 0)}</span></div>
+                  <div className="stat"><span className="label">50th Percentile (median)</span><span className="value">{formatCurrency(monteCarloData.percentiles?.[50] ?? 0)}</span></div>
+                  <div className="stat"><span className="label">95th Percentile (best case)</span><span className="value">{formatCurrency(monteCarloData.percentiles?.[95] ?? 0)}</span></div>
+                  <div className="stat"><span className="label">Probability of Profit</span><span className="value">{((monteCarloData.probability_profit ?? 0) * 100).toFixed(1)}%</span></div>
+                </div>
+                {monteCarloData.histogram_data && monteCarloData.histogram_data.length > 0 && (
+                  <ResponsiveContainer width="100%" height={280}>
+                    <BarChart data={monteCarloData.histogram_data}><CartesianGrid strokeDasharray="3 3" stroke="var(--border)" /><XAxis dataKey="bin" tickFormatter={(v) => formatCurrency(v)} stroke="var(--text-secondary)" /><YAxis stroke="var(--text-secondary)" /><Tooltip formatter={(v) => [v, 'Count']} labelFormatter={(l) => formatCurrency(l)} /><Bar dataKey="count" fill="var(--accent)" /></BarChart>
+                  </ResponsiveContainer>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+
+        {activeTab === 'Dashboard' && (
+          <div className="dashboard-grid" style={{ paddingTop: 0 }}>
+            {/* Hero */}
+            <div className="hero" style={{ gridColumn: '1 / -1' }}>
+              {loading && !portfolio && !performance ? (
+                <>
+                  <div className="skeleton skeleton-hero-value" style={{ marginBottom: '1rem' }} />
+                  <div className="hero-secondary">
+                    {[1, 2, 3, 4].map((i) => <div key={i} className="skeleton skeleton-hero-stat" />)}
                   </div>
                 </>
-              ) : null}
-              <div className="stat">
-                <span className="label">Portfolio Value</span>
-                <span className="value">{formatCurrency(portfolio.portfolio_value)}</span>
-              </div>
-              <div className="stat">
-                <span className="label">Cash</span>
-                <span className="value">{formatCurrency(portfolio.cash)}</span>
-              </div>
-              <div className="stat">
-                <span className="label">Strategy</span>
-                <span className="value">{portfolio.strategy ?? '—'}</span>
-              </div>
-            </div>
-          ) : (
-            <div className="empty-placeholder">No portfolio data</div>
-          )}
-        </div>
-
-        {/* Performance Metrics */}
-        <div className="card">
-          <h2>Performance Metrics</h2>
-          {loading && !performance ? (
-            <div className="loading-placeholder">Loading...</div>
-          ) : performance ? (
-            <div className="stats">
-              <div className="stat">
-                <span className="label">Total Return</span>
-                <span className={`value ${performance.total_return >= 0 ? 'positive' : 'negative'}`}>
-                  {formatPercent(performance.total_return)}
-                </span>
-              </div>
-              <div className="stat">
-                <span className="label">Number of Trades</span>
-                <span className="value">{performance.num_trades}</span>
-              </div>
-              <div className="stat">
-                <span className="label">Current Value</span>
-                <span className="value">{formatCurrency(performance.current_value)}</span>
-              </div>
-              <div className="stat">
-                <span className="label">Initial Value</span>
-                <span className="value">
-                  {performance.initial_value != null ? formatCurrency(performance.initial_value) : '—'}
-                </span>
-              </div>
-            </div>
-          ) : (
-            <div className="empty-placeholder">No performance data</div>
-          )}
-        </div>
-
-        {/* Backtest Results + Monte Carlo (stacked in analysis column) */}
-        <div className="analysis-column">
-          <div className="card">
-            <h2>Backtest Results {backtestResult?.ticker && `(${backtestResult.ticker})`}</h2>
-            {backtestResult && (backtestResult.total_return !== undefined || backtestResult.equity_curve) ? (
-              <div className="stats">
-                {backtestResult.params_used && (
-                  <div className="stat params-used">
-                    <span className="label">Params used</span>
-                    <span className="value params-text">
-                      {backtestResult.params_used.strategy === 'Stat Arb'
-                        ? `${backtestResult.params_used.ticker_a ?? backtestResult.ticker?.split('-')[0] ?? '—'}-${backtestResult.params_used.ticker_b ?? backtestResult.ticker?.split('-')[1] ?? '—'}, lookback ${backtestResult.params_used.lookback ?? '—'}, entry z ${backtestResult.params_used.entry_threshold ?? '—'}, exit z ${backtestResult.params_used.exit_threshold ?? '—'}`
-                        : backtestResult.params_used.strategy === 'MeanReversion'
-                          ? `Short MA ${backtestResult.params_used.short_window ?? '—'}, Long MA ${backtestResult.params_used.long_window ?? '—'}`
-                          : `Lookback ${backtestResult.params_used.lookback_period ?? '—'} days`}
+              ) : (
+                <>
+                  <div className="hero-primary">
+                    <span className="hero-value">
+                      {formatCurrency(portfolio?.portfolio_value ?? performance?.current_value ?? 0)}
                     </span>
+                    {performance && (
+                      <span className={`hero-return ${(performance.total_return ?? 0) >= 0 ? 'positive' : 'negative'}`}>
+                        {formatPercentSigned(performance.total_return ?? 0)}
+                      </span>
+                    )}
+                  </div>
+                  <div className="hero-secondary">
+                    <span className="hero-stat"><strong>Cash</strong> {formatCurrency(portfolio?.cash ?? 0)}</span>
+                    <span className="hero-stat"><strong>Positions</strong> {positionsCount}</span>
+                    {pairs.length > 0 && <span className="hero-stat"><strong>Pairs</strong> {pairs.length}</span>}
+                    {daysRunning != null && <span className="hero-stat"><strong>Days running</strong> {daysRunning}</span>}
+                    <span className="hero-stat"><strong>Strategy</strong> {portfolio?.strategy ?? '—'}</span>
+                    {portfolio?.timestamp && <span className="hero-stat"><strong>Last updated</strong> {timeAgo(portfolio.timestamp)}</span>}
+                  </div>
+                </>
+              )}
+            </div>
+
+            <div className="dashboard-main">
+              {/* Equity Curve */}
+              <div className="card">
+                <h2>Equity Curve</h2>
+                <div className="chart-range">
+                  {['1M', '3M', '6M', '1Y', 'All'].map((r) => (
+                    <button key={r} type="button" className={`chart-range-btn ${chartRange === r ? 'active' : ''}`} onClick={() => setChartRange(r)}>{r}</button>
+                  ))}
+                </div>
+                {loading && history.length === 0 && !backtestResult ? (
+                  <div className="loading-placeholder chart-placeholder" style={{ minHeight: 320 }}><div className="skeleton skeleton-line" style={{ height: 320 }} /></div>
+                ) : chartData.length > 0 ? (
+                  <ResponsiveContainer width="100%" height={360}>
+                    <LineChart data={chartData} margin={{ top: 8, right: 8, left: 8, bottom: 8 }}>
+                      <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
+                      <XAxis dataKey="timestamp" tickFormatter={(ts) => (ts ? new Date(ts).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: '2-digit' }) : '')} stroke="var(--text-secondary)" />
+                      <YAxis tickFormatter={(v) => v != null ? `$${(v / 1000).toFixed(0)}k` : ''} stroke="var(--text-secondary)" />
+                      <Tooltip formatter={(value) => value != null ? formatCurrency(value) : '—'} labelFormatter={(label) => label ? new Date(label).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' }) : ''} contentStyle={{ background: 'var(--card)', border: '1px solid var(--border)', borderRadius: 8 }} />
+                      <Legend />
+                      <Line type="monotone" dataKey="portfolio_value" stroke="var(--accent)" strokeWidth={2} name="Live" connectNulls={false} dot={false} />
+                      <Line type="monotone" dataKey="backtest_value" stroke="var(--text-secondary)" strokeWidth={2} strokeDasharray="5 5" name="Backtest" connectNulls={false} dot={false} />
+                    </LineChart>
+                  </ResponsiveContainer>
+                ) : (
+                  <div className="empty-state chart-placeholder" style={{ minHeight: 320 }}>
+                    <p>No backtest data yet. Run your first backtest to see strategy performance and compare live vs historical.</p>
+                    <button type="button" className="empty-state-cta" onClick={() => setActiveTab('Backtest')}>Run your first backtest →</button>
                   </div>
                 )}
-                <div className="stat">
-                  <span className="label">Total Return</span>
-                  <span className={`value ${(backtestResult.total_return ?? 0) >= 0 ? 'positive' : 'negative'}`}>
-                    {formatPercent(backtestResult.total_return ?? 0)}
-                  </span>
-                </div>
-                <div className="stat">
-                  <span className="label">Sharpe Ratio</span>
-                  <span className="value">{Number(backtestResult.sharpe_ratio ?? 0).toFixed(2)}</span>
-                </div>
-                <div className="stat">
-                  <span className="label">Max Drawdown</span>
-                  <span className="value negative">{formatPercent(backtestResult.max_drawdown ?? 0)}</span>
-                </div>
-                <div className="stat">
-                  <span className="label">Number of Trades</span>
-                  <span className="value">{backtestResult.num_trades ?? 0}</span>
-                </div>
               </div>
-            ) : (
-              <div className="empty-placeholder">
-                Enter ticker(s), set strategy and params, then click Run strategy
-              </div>
-            )}
-            {backtestResult && (backtestResult.total_return !== undefined || backtestResult.equity_curve) && (
-              <div style={{ marginTop: '1rem' }}>
-                <button
-                  type="button"
-                  onClick={() => fetchMonteCarlo(backtestResult.ticker, backtestResult.strategy || strategySelect)}
-                  disabled={monteCarloLoading}
-                  style={{
-                    padding: '10px 20px',
-                    background: '#2E86AB',
-                    color: 'white',
-                    border: 'none',
-                    borderRadius: '8px',
-                    cursor: 'pointer',
-                    fontSize: '14px',
-                    fontWeight: '600',
-                  }}
-                >
-                  {monteCarloLoading ? 'Running…' : 'Run Monte Carlo Simulation'}
-                </button>
-                {monteCarloError && <span className="backtest-error" style={{ display: 'block', marginTop: '0.5rem' }}>{monteCarloError}</span>}
-              </div>
-            )}
-          </div>
-        </div>
 
-        {/* Comparison */}
-        {backtestResult && (backtestResult.total_return !== undefined) && performance && (
-          <div className="card comparison-card">
-            <h2>Backtest vs Live</h2>
-            <div className="comparison-stats">
-              <div className="comparison-row">
-                <span className="label">Backtest predicted</span>
-                <span className={`value ${(backtestResult.total_return ?? 0) >= 0 ? 'positive' : 'negative'}`}>
-                  {formatPercent(backtestResult.total_return ?? 0)}
-                </span>
-              </div>
-              <div className="comparison-row">
-                <span className="label">Live performance</span>
-                <span className={`value ${(performance.total_return ?? 0) >= 0 ? 'positive' : 'negative'}`}>
-                  {formatPercent(performance.total_return ?? 0)}
-                </span>
-              </div>
-              <div className="comparison-row">
-                <span className="label">Gap</span>
-                <span className="value negative">
-                  {formatPercent((performance.total_return ?? 0) - (backtestResult.total_return ?? 0))}
-                </span>
+              {/* Backtest vs Live */}
+              <div className="card">
+                <h2>Backtest vs Live</h2>
+                {backtestResult && (backtestResult.total_return !== undefined) && performance ? (
+                  <>
+                    <table className="comparison-table">
+                      <thead><tr><th>Metric</th><th>Backtest</th><th>Live</th><th>Gap</th></tr></thead>
+                      <tbody>
+                        <tr>
+                          <td>Total Return</td>
+                          <td className={(backtestResult.total_return ?? 0) >= 0 ? 'num-positive' : 'num-negative'}>{formatPercentSigned(backtestResult.total_return ?? 0)}</td>
+                          <td className={(performance.total_return ?? 0) >= 0 ? 'num-positive' : 'num-negative'}>{formatPercentSigned(performance.total_return ?? 0)}</td>
+                          <td className={((performance.total_return ?? 0) - (backtestResult.total_return ?? 0)) >= 0 ? 'num-positive' : 'num-negative'}>{formatPercentSigned((performance.total_return ?? 0) - (backtestResult.total_return ?? 0))}</td>
+                        </tr>
+                        <tr>
+                          <td>Sharpe Ratio</td>
+                          <td>{backtestResult.sharpe_ratio != null ? Number(backtestResult.sharpe_ratio).toFixed(2) : '—'}</td>
+                          <td>{liveSharpe != null ? liveSharpe.toFixed(2) : '—'}</td>
+                          <td>{liveSharpe != null && backtestResult.sharpe_ratio != null ? (liveSharpe - backtestResult.sharpe_ratio).toFixed(2) : '—'}</td>
+                        </tr>
+                        <tr>
+                          <td>Max Drawdown</td>
+                          <td className="num-negative">{formatPercentSigned(backtestResult.max_drawdown ?? 0)}</td>
+                          <td className="num-negative">{liveMaxDrawdown != null ? formatPercentSigned(liveMaxDrawdown) : '—'}</td>
+                          <td>{liveMaxDrawdown != null && backtestResult.max_drawdown != null ? (liveMaxDrawdown - backtestResult.max_drawdown >= 0 ? '+' : '') + formatPercentSigned(liveMaxDrawdown - backtestResult.max_drawdown) : '—'}</td>
+                        </tr>
+                      </tbody>
+                    </table>
+                    <p className="comparison-note">Gap reflects execution costs, slippage, and timing.</p>
+                  </>
+                ) : (
+                  <>
+                    <table className="comparison-table">
+                      <thead><tr><th>Metric</th><th>Backtest</th><th>Live</th><th>Gap</th></tr></thead>
+                      <tbody>
+                        <tr className="placeholder-row"><td>Total Return</td><td>—</td><td>—</td><td>—</td></tr>
+                        <tr className="placeholder-row"><td>Sharpe Ratio</td><td>—</td><td>—</td><td>—</td></tr>
+                        <tr className="placeholder-row"><td>Max Drawdown</td><td>—</td><td>—</td><td>—</td></tr>
+                      </tbody>
+                    </table>
+                    <div className="empty-state" style={{ paddingTop: '1rem', paddingBottom: 0 }}>
+                      <p style={{ marginBottom: '0.75rem' }}>No backtest data yet. Run your first backtest to see comparison.</p>
+                      <button type="button" className="empty-state-cta" onClick={() => setActiveTab('Backtest')}>Run your first backtest to see comparison →</button>
+                    </div>
+                  </>
+                )}
               </div>
             </div>
-            <p className="comparison-note">Gap reflects execution costs, slippage, and timing.</p>
-          </div>
-        )}
 
-        {showMonteCarlo && monteCarloData && !monteCarloData.error && (
-          <div className="card chart-card monte-carlo-card">
-            <h2>Monte Carlo Simulation (10,000 runs)</h2>
-            <div className="stats monte-carlo-stats">
-              <div className="stat">
-                <span className="label">5th Percentile (worst case)</span>
-                <span className={`value ${(monteCarloData.percentiles?.[5] ?? 0) < (monteCarloData.percentiles?.[50] ?? 0) ? 'negative' : ''}`}>
-                  {formatCurrency(monteCarloData.percentiles?.[5] ?? 0)}
-                </span>
+            <div className="dashboard-sidebar">
+              {/* Current Holdings */}
+              <div className="card">
+                <h2>Current Holdings</h2>
+                {loading && !portfolio ? (
+                  <div className="skeleton skeleton-line" style={{ height: 24, marginBottom: 8 }} />
+                ) : positionsFromPortfolio.length > 0 ? (
+                  <>
+                    <ul className="holdings-compact-list">
+                      {positionsFromPortfolio.slice(0, 8).map((row) => (
+                        <li key={row.symbol}>
+                          <span><strong>{row.symbol}</strong> {row.qty} · <span className={(row.pnl_pct ?? 0) >= 0 ? 'positive' : 'negative'}>{row.pnl_pct != null ? formatPercentSigned(row.pnl_pct) : '—'}</span></span>
+                          <span className={`holdings-compact-badge ${row.qty >= 0 ? 'long' : 'short'}`}>{row.qty >= 0 ? 'LONG' : 'SHORT'}</span>
+                        </li>
+                      ))}
+                    </ul>
+                    <button type="button" className="card-link" onClick={() => setActiveTab('Portfolio')}>View all positions →</button>
+                  </>
+                ) : (
+                  <p className="empty-placeholder">No open positions.</p>
+                )}
               </div>
-              <div className="stat">
-                <span className="label">50th Percentile (median)</span>
-                <span className="value">
-                  {formatCurrency(monteCarloData.percentiles?.[50] ?? 0)}
-                </span>
+
+              {/* Recent Activity */}
+              <div className="card">
+                <h2>Recent Activity</h2>
+                {loading && trades.length === 0 ? (
+                  <div className="skeleton skeleton-line" style={{ height: 20, marginBottom: 8 }} />
+                ) : recentTrades.length > 0 ? (
+                  <>
+                    {recentTrades.map((trade) => (
+                      <div key={trade.id} className="activity-row">
+                        <span>{new Date(trade.timestamp).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })}</span>
+                        <span><strong>{trade.ticker}</strong></span>
+                        <span className={trade.side === 'BUY' ? 'buy' : 'sell'}>{trade.side}</span>
+                        <span>{trade.qty}</span>
+                      </div>
+                    ))}
+                    <button type="button" className="card-link" onClick={() => setActiveTab('Trades')}>View full history →</button>
+                  </>
+                ) : (
+                  <div className="empty-state">
+                    <p>No trades yet. Run your first backtest to start trading.</p>
+                    <button type="button" className="empty-state-cta" onClick={() => setActiveTab('Backtest')}>Run backtest →</button>
+                  </div>
+                )}
               </div>
-              <div className="stat">
-                <span className="label">95th Percentile (best case)</span>
-                <span className="value positive">
-                  {formatCurrency(monteCarloData.percentiles?.[95] ?? 0)}
-                </span>
-              </div>
-              <div className="stat">
-                <span className="label">Probability of Profit</span>
-                <span className="value">
-                  {((monteCarloData.probability_profit ?? 0) * 100).toFixed(1)}%
-                </span>
+
+              {/* Monte Carlo Summary */}
+              <div className="card">
+                <h2>Monte Carlo Summary</h2>
+                {monteCarloData && !monteCarloData.error ? (
+                  <>
+                    <div className="mc-summary-bar">
+                      <div className="mc-summary-segment" style={{ width: '30%', background: 'var(--negative)' }} title="5th %" />
+                      <div className="mc-summary-segment" style={{ width: '40%', background: 'var(--text-secondary)' }} title="50th %" />
+                      <div className="mc-summary-segment" style={{ width: '30%', background: 'var(--positive)' }} title="95th %" />
+                    </div>
+                    <div className="hero-stat"><span className="label">5th / 50th / 95th</span> {formatCurrency(monteCarloData.percentiles?.[5] ?? 0)} / {formatCurrency(monteCarloData.percentiles?.[50] ?? 0)} / {formatCurrency(monteCarloData.percentiles?.[95] ?? 0)}</div>
+                    <div className="mc-summary-prob">Probability of profit: {((monteCarloData.probability_profit ?? 0) * 100).toFixed(1)}%</div>
+                    <button type="button" className="card-link" onClick={() => setActiveTab('Backtest')}>View full simulation →</button>
+                  </>
+                ) : (
+                  <div className="empty-state">
+                    <p>Run a backtest and Monte Carlo to see outcome distribution.</p>
+                    <button type="button" className="empty-state-cta" onClick={() => setActiveTab('Backtest')}>Run backtest & Monte Carlo →</button>
+                  </div>
+                )}
               </div>
             </div>
-            {monteCarloData.histogram_data && monteCarloData.histogram_data.length > 0 && (() => {
-              const mean = monteCarloData.mean ?? 0;
-              const std = monteCarloData.std || 1;
-              const normalPDF = (x) => (1 / (std * Math.sqrt(2 * Math.PI))) * Math.exp(-0.5 * Math.pow((x - mean) / std, 2));
-              const bins = monteCarloData.histogram_data.map((d) => d.bin);
-              const maxCount = Math.max(...monteCarloData.histogram_data.map((d) => d.count));
-              const densities = bins.map(normalPDF);
-              const maxDensity = Math.max(...densities);
-              const scale = maxDensity > 0 ? maxCount / maxDensity : 0;
-              const chartData = monteCarloData.histogram_data.map((d, i) => ({
-                ...d,
-                normalCurve: scale * normalPDF(d.bin),
-              }));
-              return (
-                <ResponsiveContainer width="100%" height={280}>
-                  <ComposedChart data={chartData} margin={{ top: 8, right: 8, bottom: 8, left: 8 }}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
-                    <XAxis
-                      dataKey="bin"
-                      tickFormatter={(value) => `$${(value / 1000).toFixed(0)}k`}
-                      stroke="#94a3b8"
-                    />
-                    <YAxis stroke="#94a3b8" />
-                    <Tooltip
-                      formatter={(value, name) => [name === 'normalCurve' ? value.toFixed(0) + ' (fit)' : value, name === 'normalCurve' ? 'Normal curve' : 'Count']}
-                      labelFormatter={(label) => `Portfolio Value: ${formatCurrency(label)}`}
-                    />
-                    <Legend />
-                    <Bar dataKey="count" fill="#2E86AB" name="Simulations" radius={[2, 2, 0, 0]} />
-                    <Line type="monotone" dataKey="normalCurve" stroke="#f59e0b" strokeWidth={2} dot={false} name="Normal fit" />
-                  </ComposedChart>
-                </ResponsiveContainer>
-              );
-            })()}
+
+            {/* Collapsible strategy help */}
+            <div style={{ gridColumn: '1 / -1', marginTop: '1rem' }}>
+              <button type="button" className="strategy-help-toggle" onClick={() => setStrategyHelpOpen((o) => !o)}>
+                {strategyHelpOpen ? '▼' : '▶'} How the strategies work
+              </button>
+              {strategyHelpOpen && (
+                <div className="card strategy-help" style={{ marginTop: '0.5rem' }}>
+                  {strategySelect === 'Stat Arb' ? (
+                    <div className="help-content">
+                      <p><strong>Stat Arb (statistical arbitrage / pairs trading)</strong></p>
+                      <p>Trade two <strong>cointegrated</strong> stocks (e.g. AAPL/MSFT, KO/PEP). The spread is log(price_A) − β·log(price_B). When the spread&apos;s <strong>z-score</strong> exceeds the entry threshold, the strategy goes short the spread (sell A, buy B); when z-score is below −entry, it goes long (buy A, sell B). It closes when |z| &lt; exit threshold.</p>
+                      <div className="z-score-explainer">
+                        <h3>What is Z-Score?</h3>
+                        <p>Measures how far the price spread is from normal:</p>
+                        <ul>
+                          <li><strong>Z = 0:</strong> Spread is at historical average (neutral)</li>
+                          <li><strong>Z = +2:</strong> Stock A is expensive vs Stock B (sell A, buy B)</li>
+                          <li><strong>Z = -2:</strong> Stock A is cheap vs Stock B (buy A, sell B)</li>
+                          <li><strong>|Z| &lt; 0.5:</strong> Close position (back to normal)</li>
+                        </ul>
+                      </div>
+                    </div>
+                  ) : strategySelect === 'MA Crossover' ? (
+                    <div className="help-content">
+                      <p><strong>MA Crossover (moving average crossover)</strong></p>
+                      <p><strong>Short MA</strong> and <strong>Long MA</strong> are the number of trading days used to compute two moving averages of the stock&apos;s closing price. The short MA reacts faster to recent prices; the long MA is smoother.</p>
+                      <p><strong>Buy:</strong> when the short MA crosses above the long MA (short &gt; long). <strong>Sell:</strong> when the short MA crosses below the long MA.</p>
+                      <p>Example: 50/200 means buy when the 50-day average is above the 200-day average.</p>
+                    </div>
+                  ) : (
+                    <div className="help-content">
+                      <p><strong>Momentum</strong></p>
+                      <p>The strategy looks at the stock&apos;s <strong>total return over the last N days</strong> (the lookback). If that return is positive, it goes long; if negative, it goes to cash.</p>
+                      <p><strong>Lookback (days)</strong> is that N: e.g. 120 ≈ 6 months. Shorter lookback reacts faster; longer follow longer-term trend.</p>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
           </div>
         )}
-
-        {/* Equity Curve */}
-        <div className="card chart-card">
-          <h2>Equity Curve</h2>
-          {loading && history.length === 0 && !backtestResult ? (
-            <div className="loading-placeholder chart-placeholder">Loading...</div>
-          ) : chartData.length > 0 ? (
-            <ResponsiveContainer width="100%" height={300}>
-              <LineChart data={chartData}>
-                <CartesianGrid strokeDasharray="3 3" />
-                <XAxis 
-                  dataKey="timestamp" 
-                  tickFormatter={(ts) => (ts ? new Date(ts).toLocaleDateString() : '')}
-                />
-                <YAxis tickFormatter={(v) => v != null ? `$${(v / 1000).toFixed(0)}k` : ''} />
-                <Tooltip 
-                  formatter={(value) => value != null ? formatCurrency(value) : '—'}
-                  labelFormatter={(label) => label ? new Date(label).toLocaleString() : ''}
-                />
-                <Legend />
-                <Line 
-                  type="monotone" 
-                  dataKey="portfolio_value" 
-                  stroke="#2E86AB" 
-                  strokeWidth={2}
-                  name="Live"
-                  connectNulls={false}
-                />
-                <Line 
-                  type="monotone" 
-                  dataKey="backtest_value" 
-                  stroke="#94a3b8" 
-                  strokeWidth={2}
-                  strokeDasharray="5 5"
-                  name="Backtest"
-                  connectNulls={false}
-                />
-              </LineChart>
-            </ResponsiveContainer>
-          ) : (
-            <div className="empty-placeholder chart-placeholder">No portfolio history yet. Load a backtest to compare.</div>
-          )}
-        </div>
-
-        {/* Trades */}
-        <div className="card">
-          <h2>Trades</h2>
-          <div className="trades-table">
-            {loading && trades.length === 0 && pairTrades.length === 0 ? (
-              <div className="loading-placeholder">Loading...</div>
-            ) : strategySelect === 'Stat Arb' && pairTrades.length > 0 ? (
-              <table>
-                <thead>
-                  <tr>
-                    <th>Time</th>
-                    <th>Strategy</th>
-                    <th>Pair</th>
-                    <th>Side A</th>
-                    <th>Side B</th>
-                    <th>Qty A</th>
-                    <th>Qty B</th>
-                    <th>Spread</th>
-                    <th>Z-score</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {pairTrades.map(pt => (
-                    <tr key={pt.id}>
-                      <td>{new Date(pt.timestamp).toLocaleString()}</td>
-                      <td>{pt.strategy ?? '—'}</td>
-                      <td>{pt.pair_name ?? `${pt.ticker_a}-${pt.ticker_b}`}</td>
-                      <td className={pt.side_a === 'BUY' ? 'buy' : 'sell'}>{pt.side_a}</td>
-                      <td className={pt.side_b === 'BUY' ? 'buy' : 'sell'}>{pt.side_b}</td>
-                      <td>{pt.qty_a}</td>
-                      <td>{pt.qty_b}</td>
-                      <td>{pt.spread != null ? Number(pt.spread).toFixed(4) : '—'}</td>
-                      <td>{pt.z_score != null ? Number(pt.z_score).toFixed(2) : '—'}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            ) : (
-            <table>
-              <thead>
-                <tr>
-                  <th>Time</th>
-                  <th>Strategy</th>
-                  <th>Params</th>
-                  <th>Side</th>
-                  <th>Ticker</th>
-                  <th>Qty</th>
-                  <th>Price</th>
-                  <th>Status</th>
-                  <th>Actions</th>
-                </tr>
-              </thead>
-              <tbody>
-                {trades.map(trade => (
-                  <tr key={trade.id}>
-                    <td>{new Date(trade.timestamp).toLocaleString()}</td>
-                    <td>{trade.strategy ?? '—'}</td>
-                    <td>{formatTradeParams(trade)}</td>
-                    <td className={trade.side === 'BUY' ? 'buy' : 'sell'}>{trade.side}</td>
-                    <td>{trade.ticker}</td>
-                    <td>{trade.qty}</td>
-                    <td>{trade.price ? formatCurrency(trade.price) : '-'}</td>
-                    <td>{trade.status}</td>
-                    <td>
-                      <button type="button" className="delete-trade-btn" onClick={() => deleteTrade(trade.id)}>Delete</button>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-            )}
-          </div>
-        </div>
       </div>
     </div>
   );

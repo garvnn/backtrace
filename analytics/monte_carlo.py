@@ -1,5 +1,8 @@
 """
 Monte Carlo simulation for strategy robustness testing.
+
+Uses daily percentage returns from the equity curve and block-bootstrap resampling
+to simulate realistic paths (avoids iid resampling which can produce unrealistic tails).
 """
 
 import sys
@@ -9,15 +12,23 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 import pandas as pd
 
+# Block size for block bootstrap (consecutive days); preserves return autocorrelation
+# and avoids unrealistic sequences (e.g. many copies of the best day).
+DEFAULT_BLOCK_DAYS = 20
 
-def run_monte_carlo(portfolio_values, num_simulations=10000, initial_capital=100000):
+
+def run_monte_carlo(portfolio_values, num_simulations=10000, initial_capital=100000, block_days=DEFAULT_BLOCK_DAYS):
     """
-    Bootstrap returns to simulate possible outcomes.
+    Block-bootstrap daily percentage returns to simulate possible outcomes.
+
+    Uses daily % returns from portfolio_values (not cumulative values). Resamples
+    blocks of consecutive daily returns so paths stay realistic.
 
     Args:
-        portfolio_values: Series of portfolio values over time from backtest
+        portfolio_values: Series of portfolio values over time from backtest (daily).
         num_simulations: Number of simulation runs
         initial_capital: Starting portfolio value
+        block_days: Block size for block bootstrap (default 20 trading days)
 
     Returns:
         Dict with percentiles, probability_profit, histogram_data, mean, std.
@@ -27,18 +38,38 @@ def run_monte_carlo(portfolio_values, num_simulations=10000, initial_capital=100
     if portfolio_values is None or len(portfolio_values) < 2:
         return {"error": "Equity curve has too few points for Monte Carlo (need at least 2)."}
 
-    returns = portfolio_values.pct_change().dropna()
-    num_days = len(returns)
+    # Daily percentage returns only (not cumulative values)
+    daily_returns = portfolio_values.pct_change().dropna()
+    daily_returns = np.asarray(daily_returns, dtype=float)
+    num_returns = len(daily_returns)
 
-    if num_days < 1:
+    if num_returns < 1:
         return {"error": "No daily returns available for Monte Carlo."}
 
-    returns = np.asarray(returns)
+    # Sparse equity curves (e.g. only trade dates) would yield multi-period returns
+    # and unrealistic variance; require enough points to be plausibly daily.
+    if num_returns < 21:
+        return {"error": "Too few return periods for Monte Carlo (need at least 21; use daily backtest data)."}
+
+    block_days = min(max(1, block_days), num_returns)
+    num_blocks = (num_returns + block_days - 1) // block_days
+
+    # Build blocks of consecutive daily returns
+    blocks = []
+    for start in range(0, num_returns - block_days + 1):
+        blocks.append(daily_returns[start : start + block_days])
+    if not blocks:
+        blocks = [daily_returns[:block_days].copy()]
+    blocks = np.array(blocks)
 
     final_values = []
+    rng = np.random.default_rng()
     for _ in range(num_simulations):
-        sampled_returns = np.random.choice(returns, size=num_days, replace=True)
-        cumulative_return = np.prod(1 + sampled_returns)
+        # Block bootstrap: sample blocks with replacement, then concatenate to ~num_returns
+        chosen = rng.integers(0, len(blocks), size=num_blocks)
+        path = np.concatenate([blocks[i] for i in chosen])[:num_returns]
+        # Compound daily returns: (1+r1)*(1+r2)*...
+        cumulative_return = np.prod(1.0 + path)
         final_value = initial_capital * cumulative_return
         final_values.append(final_value)
 
