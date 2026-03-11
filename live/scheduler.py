@@ -1,8 +1,10 @@
 """
 Daily strategy executor - runs at market close (4:30 PM ET) on weekdays.
 
-Runs Momentum and MA Crossover on top 10 SPY tickers, plus Stat Arb on configured pairs.
-Logs to scheduler.log and console. Errors for one ticker/pair do not stop the rest.
+Runs one strategy per ticker (Momentum or MA Crossover) on top 10 SPY tickers. The strategy
+is chosen per ticker by profit probability from a short lookback backtest. Stat Arb is not
+run live; it remains available for backtesting only.
+Logs to scheduler.log and console. Errors for one ticker do not stop the rest.
 
 Usage:
   From project root:  python live/scheduler.py
@@ -41,11 +43,8 @@ TOP_10_SPY = [
     "XOM",
 ]
 
-# Stat Arb pairs (must be valid in pairs_config; subset of TOP_10_SPY)
-STAT_ARB_PAIRS = [
-    ("AAPL", "MSFT"),
-    ("GOOGL", "META"),
-]
+# Lookback days for strategy selector backtest (Momentum vs MA)
+SELECTOR_LOOKBACK_DAYS = 60
 
 # Logging: file + console
 LOG_FILE = os.path.join(LIVE_DIR, "scheduler.log")
@@ -70,44 +69,45 @@ def _get_logger():
 
 
 def run_daily_strategy():
-    """Run Momentum + MA Crossover on all tickers, then Stat Arb on configured pairs."""
+    """Run one strategy per ticker (Momentum or MA Crossover) chosen by profit probability. Stat Arb is not run live."""
     from strategies.momentum import MomentumStrategy
     from strategies.mean_reversion import MeanReversionStrategy
-    from strategies.stat_arb import StatArbStrategy
     from executor import StrategyExecutor
+    from strategy_selector import select_strategy_for_ticker
 
     log = _get_logger()
     log.info("Daily BackTrace job started")
 
-    # Single-ticker strategies: Momentum, MeanReversion (MA Crossover)
-    for strategy_class in [MomentumStrategy, MeanReversionStrategy]:
-        for ticker in TOP_10_SPY:
-            try:
-                strategy = strategy_class()
-                executor = StrategyExecutor(strategy, ticker=ticker)
-                executor.run()
-                log.info("Completed %s on %s", strategy.name, ticker)
-            except Exception as e:
-                log.error(
-                    "Failed %s on %s: %s\n%s",
-                    strategy_class.__name__,
-                    ticker,
-                    e,
-                    traceback.format_exc(),
-                )
-
-    # Stat Arb on configured pairs
-    for ticker_a, ticker_b in STAT_ARB_PAIRS:
+    for ticker in TOP_10_SPY:
         try:
-            strategy = StatArbStrategy(ticker_a, ticker_b)
-            executor = StrategyExecutor(strategy, ticker=ticker_a)
+            # Get data via executor (same source as live signals)
+            executor = StrategyExecutor(MomentumStrategy(), ticker=ticker)
+            data = executor.get_historical_data(days=SELECTOR_LOOKBACK_DAYS)
+            if data is None or (hasattr(data, "empty") and data.empty) or len(data) < 30:
+                log.warning("Skipping %s: insufficient data", ticker)
+                continue
+
+            winner_class, prob_mom, prob_ma = select_strategy_for_ticker(
+                ticker, data, lookback_days=SELECTOR_LOOKBACK_DAYS
+            )
+            winner_name = winner_class().name
+            log.info(
+                "Chosen strategy for %s: %s (profit_prob Momentum=%.2f, MA=%.2f)",
+                ticker,
+                winner_name,
+                prob_mom,
+                prob_ma,
+            )
+
+            # Run executor with winning strategy
+            strategy = winner_class()
+            executor = StrategyExecutor(strategy, ticker=ticker)
             executor.run()
-            log.info("Completed Stat Arb on %s / %s", ticker_a, ticker_b)
+            log.info("Completed %s on %s", strategy.name, ticker)
         except Exception as e:
             log.error(
-                "Failed Stat Arb %s-%s: %s\n%s",
-                ticker_a,
-                ticker_b,
+                "Failed %s: %s\n%s",
+                ticker,
                 e,
                 traceback.format_exc(),
             )

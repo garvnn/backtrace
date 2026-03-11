@@ -6,6 +6,7 @@ const API_BASE = 'http://localhost:8000';
 
 function App() {
   const [portfolio, setPortfolio] = useState(null);
+  const [positionsDetail, setPositionsDetail] = useState(null);
   const [trades, setTrades] = useState([]);
   const [performance, setPerformance] = useState(null);
   const [history, setHistory] = useState([]);
@@ -14,9 +15,7 @@ function App() {
   const [tickerInput, setTickerInput] = useState('AAPL');
   const [backtestResult, setBacktestResult] = useState(null);
   const [runLoading, setRunLoading] = useState(false);
-  const [placeTradeLoading, setPlaceTradeLoading] = useState(false);
   const [backtestError, setBacktestError] = useState(null);
-  const [executorError, setExecutorError] = useState(null);
   const [strategySelect, setStrategySelect] = useState('Momentum');
   const [shortMa, setShortMa] = useState(50);
   const [longMa, setLongMa] = useState(200);
@@ -72,6 +71,14 @@ function App() {
       if (!portfolioRes.ok) throw new Error('Failed to fetch portfolio');
       const portfolioData = await portfolioRes.json();
       setPortfolio(portfolioData);
+
+      const positionsDetailRes = await fetch(`${API_BASE}/positions-detail`);
+      if (positionsDetailRes.ok) {
+        const positionsDetailData = await positionsDetailRes.json();
+        setPositionsDetail(positionsDetailData);
+      } else {
+        setPositionsDetail(null);
+      }
 
       const tradesRes = await fetch(`${API_BASE}/trades`);
       if (!tradesRes.ok) throw new Error('Failed to fetch trades');
@@ -363,42 +370,6 @@ function App() {
     }
   };
 
-  const placeTrade = async () => {
-    await new Promise((r) => setTimeout(r, 0));
-    const { strategy, shortMa, longMa, lookbackPeriod, tickerB: tb, statArbTicker1: refT1, statArbTicker2: refT2, statArbLookback: sal, statArbEntry: sae, statArbExit: sax } = paramsForRunRef.current;
-    const ticker = (strategy === 'Stat Arb' ? (refT1 || '').trim().toUpperCase() : tickerInput.trim().toUpperCase()) || 'AAPL';
-    const tickerBVal = (strategy === 'Stat Arb' ? (refT2 || tb || '') : tb || '').trim().toUpperCase();
-    setExecutorError(null);
-    setPlaceTradeLoading(true);
-    try {
-      const body = {
-        strategy,
-        ticker,
-        short_window: shortMa,
-        long_window: longMa,
-        lookback_period: lookbackPeriod,
-      };
-      if (strategy === 'Stat Arb') {
-        body.ticker_b = tickerBVal;
-        body.lookback = sal;
-        body.entry_threshold = sae;
-        body.exit_threshold = sax;
-      }
-      const res = await fetch(`${API_BASE}/run-executor`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.detail || 'Run failed');
-      await fetchData();
-    } catch (err) {
-      setExecutorError(err.message);
-    } finally {
-      setPlaceTradeLoading(false);
-    }
-  };
-
   const deleteTrade = async (tradeId) => {
     try {
       const res = await fetch(`${API_BASE}/trades/${tradeId}`, { method: 'DELETE' });
@@ -457,12 +428,30 @@ function App() {
     ? Math.max(0, Math.floor((Date.now() - new Date(history[0].timestamp).getTime()) / 86400000))
     : null;
   const recentTrades = trades.slice(0, 5);
-  // Single source: GET /portfolio. Positions from portfolio.positions (object or array).
+  // Positions from GET /portfolio; merge in entry_price, current_price, pnl, pnl_pct from GET /positions-detail.
   const positionsFromPortfolio = (() => {
     const p = portfolio?.positions;
     if (!p) return [];
-    if (Array.isArray(p)) return p.map((x) => ({ symbol: x.symbol || x.ticker, qty: Number(x.qty ?? x.quantity ?? 0) }));
-    return Object.entries(p).map(([symbol, qty]) => ({ symbol, qty: Number(qty) }));
+    let rows = Array.isArray(p)
+      ? p.map((x) => ({ symbol: x.symbol || x.ticker, qty: Number(x.qty ?? x.quantity ?? 0) }))
+      : Object.entries(p).map(([symbol, qty]) => ({ symbol, qty: Number(qty) }));
+    const detailList = positionsDetail?.positions;
+    if (Array.isArray(detailList) && detailList.length > 0) {
+      const bySymbol = {};
+      detailList.forEach((d) => { bySymbol[d.symbol] = d; });
+      rows = rows.map((row) => {
+        const d = bySymbol[row.symbol];
+        if (!d) return row;
+        return {
+          ...row,
+          entry_price: d.entry_price,
+          current_price: d.current_price,
+          pnl: d.pnl,
+          pnl_pct: d.pnl_pct,
+        };
+      });
+    }
+    return rows;
   })();
   const positionsCount = positionsFromPortfolio.length;
 
@@ -636,7 +625,7 @@ function App() {
                   value={strategySelect}
                   onChange={(e) => { const v = e.target.value; setStrategySelect(v); paramsForRunRef.current.strategy = v; }}
                   className="strategy-select"
-                  disabled={runLoading || placeTradeLoading}
+                  disabled={runLoading}
                 >
                   <option value="Momentum">Momentum</option>
                   <option value="MA Crossover">MA Crossover</option>
@@ -680,17 +669,13 @@ function App() {
                   </>
                 )}
                 {strategySelect !== 'Stat Arb' && (
-                  <input type="text" value={tickerInput} onChange={(e) => setTickerInput(e.target.value)} placeholder="e.g. AAPL" className="ticker-input" disabled={runLoading || placeTradeLoading} />
+                  <input type="text" value={tickerInput} onChange={(e) => setTickerInput(e.target.value)} placeholder="e.g. AAPL" className="ticker-input" disabled={runLoading} />
                 )}
-                <button type="button" onClick={runStrategy} disabled={runLoading || placeTradeLoading || (strategySelect === 'Stat Arb' ? (!statArbTicker1.trim() || !statArbTicker2.trim()) : !tickerInput.trim())} className="run-strategy-btn">
-                  {runLoading ? 'Running…' : 'Run Backtest'}
-                </button>
-                <button type="button" onClick={placeTrade} disabled={runLoading || placeTradeLoading || (strategySelect === 'Stat Arb' ? (!statArbTicker1.trim() || !statArbTicker2.trim()) : !tickerInput.trim())} className="place-trade-btn">
-                  {placeTradeLoading ? 'Placing…' : 'Place trade'}
+                <button type="button" onClick={runStrategy} disabled={runLoading || (strategySelect === 'Stat Arb' ? (!statArbTicker1.trim() || !statArbTicker2.trim()) : !tickerInput.trim())} className="run-strategy-btn">
+                  {runLoading ? 'Running…' : 'Run strategy'}
                 </button>
               </div>
               {backtestError && <span className="backtest-error">{backtestError}</span>}
-              {executorError && <span className="backtest-error">{executorError}</span>}
               {strategySelect === 'Stat Arb' && pairTrades.length > 0 && (
                 <div style={{ marginTop: '1rem' }}>
                   <ZScoreGauge zScore={pairTrades[0]?.z_score ?? 0} />

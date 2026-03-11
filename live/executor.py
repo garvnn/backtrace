@@ -24,8 +24,12 @@ from strategies.stat_arb import StatArbStrategy
 from database import Database
 
 # Load .env from live/ so it works when run as "python live/executor.py" from project root
-_env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+LIVE_DIR = os.path.dirname(os.path.abspath(__file__))
+_env_path = os.path.join(LIVE_DIR, ".env")
 load_dotenv(_env_path)
+
+# Cap per-stock position size for single-ticker strategies (10 stocks = max 100k)
+MAX_DOLLAR_PER_STOCK = 10_000
 
 def _bars_to_backtrace_df(df_one):
     """Convert Alpaca bars DataFrame (single symbol) to BackTrace format: Date index, Open/High/Low/Close/Volume."""
@@ -55,7 +59,7 @@ class StrategyExecutor:
         self.trading_client = TradingClient(api_key, secret_key, paper=True)
         
         self.data_client = StockHistoricalDataClient(api_key, secret_key)
-        self.db = Database()
+        self.db = Database(os.path.join(LIVE_DIR, "trading.db"))
     
     def _is_stat_arb(self):
         return isinstance(self.strategy, StatArbStrategy) or self.strategy.name == "Stat Arb"
@@ -133,19 +137,21 @@ class StrategyExecutor:
             return 0
     
     def execute_signal(self, signal, data):
-        """Place order based on signal."""
+        """Place order based on signal. Only acts on signal change (idempotent); caps BUY at MAX_DOLLAR_PER_STOCK."""
         current_position = self.get_current_position()
         account = self.trading_client.get_account()
         buying_power = float(account.buying_power)
+        last_signal = self.db.get_last_executed_signal(self.strategy.name, self.ticker)
         
         print(f"\nCurrent position: {current_position} shares")
         print(f"Signal: {signal}")
         
-        # Signal = 1 (buy), 0 (sell/flat)
-        if signal == 1 and current_position == 0:
-            # Buy with all available cash
+        # Signal = 1 (buy), 0 (sell/flat). Only place order when signal changed from last executed.
+        if signal == 1 and current_position == 0 and last_signal != 1:
+            # Buy: cap at MAX_DOLLAR_PER_STOCK per stock
             current_price = float(data['Close'].iloc[-1])
-            qty = int(buying_power * 0.95 / current_price)
+            dollar_amount = min(MAX_DOLLAR_PER_STOCK, buying_power * 0.95)
+            qty = int(dollar_amount / current_price)
             
             if qty > 0:
                 order_data = MarketOrderRequest(
@@ -171,7 +177,7 @@ class StrategyExecutor:
                 
                 return order
         
-        elif signal == 0 and current_position > 0:
+        elif signal == 0 and current_position > 0 and last_signal != 0:
             # Sell all
             order_data = MarketOrderRequest(
                 symbol=self.ticker,

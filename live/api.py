@@ -9,10 +9,13 @@ PROJECT_ROOT = os.path.dirname(LIVE_DIR)
 sys.path.insert(0, PROJECT_ROOT)
 sys.path.insert(0, LIVE_DIR)
 
+import logging
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from database import Database
+
+logger = logging.getLogger(__name__)
 from pairs_config import get_available_pairs, is_valid_pair
 import json
 from datetime import datetime, timezone
@@ -52,11 +55,54 @@ def read_root():
     return {"message": "BackTrace Live API"}
 
 
+def _get_portfolio_from_alpaca():
+    """Fetch live portfolio from Alpaca. Returns dict or None on failure."""
+    api_key = os.getenv("ALPACA_API_KEY")
+    secret_key = os.getenv("ALPACA_SECRET_KEY")
+    if not api_key or not secret_key:
+        logger.warning("Alpaca keys missing in API process; portfolio will use DB fallback.")
+        return None
+    try:
+        from alpaca.trading.client import TradingClient
+        client = TradingClient(api_key, secret_key, paper=True)
+        account = client.get_account()
+        positions = client.get_all_positions()
+        positions_dict = {}
+        for pos in positions:
+            try:
+                qty = float(pos.qty or 0)
+            except (TypeError, ValueError):
+                qty = 0
+            if qty != 0 and getattr(pos, "symbol", None):
+                positions_dict[pos.symbol] = qty
+        return {
+            "portfolio_value": float(account.portfolio_value or 0),
+            "cash": float(account.cash or 0),
+            "positions": positions_dict,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "strategy": None,
+        }
+    except Exception as e:
+        logger.exception("Alpaca portfolio fetch failed: %s", e)
+        return None
+
+
 @app.get("/portfolio")
 def get_portfolio():
-    """Get current portfolio state. Single source of truth for Dashboard and Portfolio tabs."""
+    """Current portfolio: live from Alpaca when available, else latest DB snapshot."""
+    live = _get_portfolio_from_alpaca()
+    if live is not None:
+        # Use strategy from latest DB snapshot if we have one
+        history = db.get_portfolio_history()
+        if history:
+            live["strategy"] = history[-1][2]
+        if live["strategy"] is None:
+            live["strategy"] = "Live"
+        live["live_sync_used"] = True
+        return live
+
+    # Fallback: latest snapshot from DB (check server logs for "Alpaca portfolio fetch failed" if live expected)
     history = db.get_portfolio_history()
-    
     if not history:
         return {
             "portfolio_value": 0,
@@ -64,19 +110,18 @@ def get_portfolio():
             "positions": {},
             "timestamp": None,
             "strategy": None,
+            "live_sync_used": False,
         }
-    
-    # Get latest snapshot
     latest = history[-1]
     positions_raw = latest[5]
     positions = json.loads(positions_raw) if positions_raw else {}
-    
     return {
         "portfolio_value": float(latest[3]),
         "cash": float(latest[4]),
         "positions": positions,
         "timestamp": latest[1],
         "strategy": latest[2],
+        "live_sync_used": False,
     }
 
 

@@ -513,27 +513,6 @@ header p {
   cursor: not-allowed;
 }
 
-.place-trade-btn {
-  padding: 0.5rem 1rem;
-  border-radius: 8px;
-  border: none;
-  background: var(--accent);
-  color: #fff;
-  font-weight: 600;
-  cursor: pointer;
-  font-size: 0.95rem;
-  min-height: 44px;
-}
-
-.place-trade-btn:hover:not(:disabled) {
-  filter: brightness(1.1);
-}
-
-.place-trade-btn:disabled {
-  opacity: 0.7;
-  cursor: not-allowed;
-}
-
 .delete-trade-btn {
   padding: 0.25rem 0.5rem;
   border-radius: 4px;

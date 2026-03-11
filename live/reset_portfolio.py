@@ -52,7 +52,7 @@ def main():
                 print(f"  Failed to close {symbol}: {e}")
         print(f"Alpaca: closed {closed} position(s).")
 
-    # 2. Clear local DB tables (trades, portfolio_snapshots, backtest_results)
+    # 2. Clear local DB tables (trades, portfolio_snapshots, pair_trades, backtest_results)
     import sqlite3
     db_path = os.path.join(LIVE_DIR, "trading.db")
     conn = sqlite3.connect(db_path)
@@ -61,6 +61,8 @@ def main():
     trades_deleted = cur.rowcount
     cur.execute("DELETE FROM portfolio_snapshots")
     snapshots_deleted = cur.rowcount
+    cur.execute("DELETE FROM pair_trades")
+    pair_trades_deleted = cur.rowcount
     cur.execute("DELETE FROM backtest_results")
     backtest_deleted = cur.rowcount
     conn.commit()
@@ -76,7 +78,7 @@ def main():
         positions={},
     )
 
-    print(f"Cleared {trades_deleted} trade(s), {snapshots_deleted} snapshot(s), {backtest_deleted} backtest(s).")
+    print(f"Cleared {trades_deleted} trade(s), {snapshots_deleted} snapshot(s), {pair_trades_deleted} pair trade(s), {backtest_deleted} backtest(s).")
     print("Portfolio reset to $100,000 starting capital.")
 
 if __name__ == "__main__":

@@ -132,6 +132,25 @@ class Database:
         
         conn.commit()
         conn.close()
+
+    def get_last_executed_signal(self, strategy, ticker):
+        """Return 1 if most recent trade for (strategy, ticker) was BUY, 0 if SELL, None if no trades."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            'SELECT side FROM trades WHERE strategy = ? AND ticker = ? ORDER BY timestamp DESC LIMIT 1',
+            (strategy, ticker)
+        )
+        row = cursor.fetchone()
+        conn.close()
+        if row is None:
+            return None
+        side = (row[0] or '').upper()
+        if side == 'BUY':
+            return 1
+        if side == 'SELL':
+            return 0
+        return None
     
     def get_all_trades(self, strategy=None):
         """Get all trades, optionally filtered by strategy. Returns list of dicts with id, timestamp, strategy, ticker, side, qty, price, order_id, status, params (parsed)."""
