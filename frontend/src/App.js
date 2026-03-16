@@ -2,7 +2,11 @@ import React, { useState, useEffect, useRef } from 'react';
 import { LineChart, Line, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
 import './App.css';
 
-const API_BASE = 'http://localhost:8000';
+const API_BASE =
+  process.env.REACT_APP_API_URL ||
+  (process.env.NODE_ENV === 'production'
+    ? 'https://backtrace-production.up.railway.app'
+    : 'http://localhost:8000');
 
 function App() {
   const [portfolio, setPortfolio] = useState(null);

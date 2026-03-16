@@ -111,6 +111,8 @@ cd frontend && npm install && cd ..
 
 Run the scheduler in the background with a process manager (e.g. systemd, screen, tmux) or a PaaS (e.g. Railway). Ensure the server timezone or cron is set for Eastern Time so the 4:30 PM ET run is correct. For the API and frontend, deploy FastAPI and the React build to your chosen host; keep `live/.env` and the SQLite DB path consistent.
 
+**Vercel (frontend):** In Project Settings → Environment Variables, set `REACT_APP_API_URL` to your deployed API URL (e.g. `https://your-api.up.railway.app`). Otherwise the app defaults to `http://localhost:8000`, so visitors get a browser "Access other apps" prompt and the portfolio shows $0 until they allow (and only works if your machine is running the API).
+
 ## Metrics Calculated
 
 - **Total return:** (Final value − Initial capital) / Initial capital

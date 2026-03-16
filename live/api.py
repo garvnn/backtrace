@@ -245,12 +245,17 @@ def get_portfolio_history_endpoint(strategy: str = None):
     
     history_list = []
     for snapshot in history:
+        positions_raw = snapshot[5]
+        try:
+            positions = json.loads(positions_raw) if positions_raw else {}
+        except (TypeError, json.JSONDecodeError):
+            positions = {}
         history_list.append({
             "timestamp": snapshot[1],
             "strategy": snapshot[2],
             "portfolio_value": snapshot[3],
             "cash": snapshot[4],
-            "positions": json.loads(snapshot[5])
+            "positions": positions,
         })
     
     return {"history": history_list}

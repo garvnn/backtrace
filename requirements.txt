@@ -15,6 +15,7 @@ fastapi==0.129.0
 fonttools==4.61.1
 frozendict==2.4.7
 h11==0.16.0
+httpx==0.28.1
 idna==3.11
 kiwisolver==1.4.9
 matplotlib==3.10.8
