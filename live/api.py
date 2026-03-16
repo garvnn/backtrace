@@ -261,29 +261,25 @@ def get_portfolio_history_endpoint(strategy: str = None):
     return {"history": history_list}
 
 
+# Starting capital for live paper trading; return % is always from this baseline
+INITIAL_CAPITAL = 100_000
+
+
 @app.get("/performance")
 def get_performance(strategy: str = None):
-    """Get performance metrics."""
+    """Get performance metrics. Total return is always from original 100k capital."""
     history = db.get_portfolio_history(strategy=strategy)
-    
-    if len(history) < 2:
-        return {
-            "total_return": 0,
-            "num_trades": 0,
-            "current_value": 100000
-        }
-    
-    initial_value = history[0][3]
-    current_value = history[-1][3]
+    initial_value = INITIAL_CAPITAL
+    current_value = history[-1][3] if history else initial_value
     total_return = (current_value - initial_value) / initial_value
-    
+
     trades = db.get_all_trades(strategy=strategy)
-    
+
     return {
         "total_return": total_return,
         "num_trades": len(trades),
         "current_value": current_value,
-        "initial_value": initial_value
+        "initial_value": initial_value,
     }
 
 
