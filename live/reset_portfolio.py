@@ -54,7 +54,7 @@ def main():
 
     # 2. Clear local DB tables (trades, portfolio_snapshots, pair_trades, backtest_results)
     import sqlite3
-    db_path = os.path.join(LIVE_DIR, "trading.db")
+    db_path = os.getenv("DB_PATH") or os.path.join(LIVE_DIR, "trading.db")
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
     cur.execute("DELETE FROM trades")

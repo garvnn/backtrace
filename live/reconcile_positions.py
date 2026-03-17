@@ -16,6 +16,7 @@ from dotenv import load_dotenv
 load_dotenv(os.path.join(LIVE_DIR, ".env"))
 
 from database import Database
+DB_PATH = os.getenv("DB_PATH") or os.path.join(LIVE_DIR, "trading.db")
 
 
 def fetch_alpaca_positions():
@@ -36,7 +37,7 @@ def fetch_alpaca_positions():
 
 def fetch_db_positions():
     """Return dict symbol -> quantity from latest portfolio_snapshot (any strategy)."""
-    db = Database(os.path.join(LIVE_DIR, "trading.db"))
+    db = Database(DB_PATH)
     history = db.get_portfolio_history()
     if not history:
         return {}

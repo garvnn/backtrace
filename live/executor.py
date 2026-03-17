@@ -27,6 +27,7 @@ from database import Database
 LIVE_DIR = os.path.dirname(os.path.abspath(__file__))
 _env_path = os.path.join(LIVE_DIR, ".env")
 load_dotenv(_env_path)
+DB_PATH = os.getenv("DB_PATH") or os.path.join(LIVE_DIR, "trading.db")
 
 # Cap per-stock position size for single-ticker strategies (10 stocks = max 100k)
 MAX_DOLLAR_PER_STOCK = 10_000
@@ -59,7 +60,7 @@ class StrategyExecutor:
         self.trading_client = TradingClient(api_key, secret_key, paper=True)
         
         self.data_client = StockHistoricalDataClient(api_key, secret_key)
-        self.db = Database(os.path.join(LIVE_DIR, "trading.db"))
+        self.db = Database(DB_PATH)
     
     def _is_stat_arb(self):
         return isinstance(self.strategy, StatArbStrategy) or self.strategy.name == "Stat Arb"

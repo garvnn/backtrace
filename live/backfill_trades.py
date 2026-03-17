@@ -10,7 +10,7 @@ import sqlite3
 
 LIVE_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(LIVE_DIR)
-LIVE_DB = os.path.join(LIVE_DIR, "trading.db")
+LIVE_DB = os.getenv("DB_PATH") or os.path.join(LIVE_DIR, "trading.db")
 ROOT_DB = os.path.join(PROJECT_ROOT, "trading.db")
 
 

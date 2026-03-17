@@ -34,7 +34,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-db = Database(os.path.join(LIVE_DIR, "trading.db"))
+DB_PATH = os.getenv("DB_PATH") or os.path.join(LIVE_DIR, "trading.db")
+db = Database(DB_PATH)
 
 # Max equity curve points returned to frontend to avoid OOM / DataCloneError
 EQUITY_CURVE_MAX_POINTS = 400
