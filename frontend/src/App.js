@@ -12,6 +12,8 @@ function App() {
   const [portfolio, setPortfolio] = useState(null);
   const [positionsDetail, setPositionsDetail] = useState(null);
   const [trades, setTrades] = useState([]);
+  const [executionLogs, setExecutionLogs] = useState([]);
+  const [expandedExecutionLogIds, setExpandedExecutionLogIds] = useState({});
   const [performance, setPerformance] = useState(null);
   const [history, setHistory] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -88,6 +90,14 @@ function App() {
       if (!tradesRes.ok) throw new Error('Failed to fetch trades');
       const tradesData = await tradesRes.json();
       setTrades(tradesData.trades);
+
+      const executionLogsRes = await fetch(`${API_BASE}/execution-logs?limit=200`);
+      if (executionLogsRes.ok) {
+        const executionLogsData = await executionLogsRes.json();
+        setExecutionLogs(executionLogsData.execution_logs || []);
+      } else {
+        setExecutionLogs([]);
+      }
 
       const perfRes = await fetch(`${API_BASE}/performance`);
       if (!perfRes.ok) throw new Error('Failed to fetch performance');
@@ -395,6 +405,23 @@ function App() {
     return `Lookback ${p.lookback_period ?? '—'} days`;
   };
 
+  const formatExecutionSignal = (signal) => {
+    if (signal == null || signal === '' || signal === 'N/A') return '—';
+    if (signal.includes(',')) {
+      const [a, b] = signal.split(',');
+      return `${a}/${b}`;
+    }
+    if (signal === '1') return 'BUY';
+    if (signal === '0') return 'FLAT';
+    if (signal === '-1') return 'SHORT';
+    return signal;
+  };
+
+  const humanizeReason = (reason) => {
+    if (!reason) return '—';
+    return reason.replaceAll('_', ' ');
+  };
+
   // Combined chart data: live + backtest (backtest scaled to same start as live)
   const chartDataFull = (() => {
     const backtestCurve = backtestResult?.equity_curve || [];
@@ -616,6 +643,62 @@ function App() {
             </div>
             {loading && trades.length === 0 && pairTrades.length === 0 && <div className="loading-placeholder">Loading…</div>}
             {!loading && trades.length === 0 && pairTrades.length === 0 && <p className="empty-placeholder">No trades yet — run your first backtest.</p>}
+
+            <div className="decision-logs-section">
+              <h2>Decision Logs</h2>
+              <p className="decision-logs-note">Shows why the executor placed a trade or skipped one.</p>
+              <div className="trades-table">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Time</th>
+                      <th>Strategy</th>
+                      <th>Ticker/Pair</th>
+                      <th>Signal</th>
+                      <th>Action</th>
+                      <th>Reason</th>
+                      <th>Details</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {executionLogs.map((log) => {
+                      const expanded = !!expandedExecutionLogIds[log.id];
+                      return (
+                        <React.Fragment key={log.id}>
+                          <tr>
+                            <td>{new Date(log.timestamp).toLocaleString()}</td>
+                            <td>{log.strategy ?? '—'}</td>
+                            <td>{log.ticker ?? '—'}</td>
+                            <td>{formatExecutionSignal(log.signal)}</td>
+                            <td className={log.action === 'NO_TRADE' ? '' : (String(log.action).includes('SELL') ? 'sell' : 'buy')}>{log.action}</td>
+                            <td className={log.action === 'NO_TRADE' ? 'decision-reason-no-trade' : ''}>{humanizeReason(log.reason)}</td>
+                            <td>
+                              {log.details ? (
+                                <button
+                                  type="button"
+                                  className="details-toggle-btn"
+                                  onClick={() => setExpandedExecutionLogIds((prev) => ({ ...prev, [log.id]: !prev[log.id] }))}
+                                >
+                                  {expanded ? 'Hide' : 'Show'}
+                                </button>
+                              ) : '—'}
+                            </td>
+                          </tr>
+                          {expanded && log.details && (
+                            <tr>
+                              <td colSpan={7}>
+                                <pre className="execution-details-json">{JSON.stringify(log.details, null, 2)}</pre>
+                              </td>
+                            </tr>
+                          )}
+                        </React.Fragment>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+              {!loading && executionLogs.length === 0 && <p className="empty-placeholder">No decision logs yet — run the executor once.</p>}
+            </div>
           </div>
         )}
 

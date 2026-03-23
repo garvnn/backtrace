@@ -136,6 +136,24 @@ class StrategyExecutor:
             return 0
         except Exception:
             return 0
+
+    def _serialize_signal(self, signal):
+        """Normalize signal value to stable string."""
+        try:
+            return str(int(signal))
+        except Exception:
+            return str(signal)
+
+    def _log_execution_event(self, ticker, signal, action, reason, details):
+        """Persist execution decision for audit/debugging."""
+        self.db.log_execution(
+            strategy=self.strategy.name,
+            ticker=ticker,
+            signal=self._serialize_signal(signal),
+            action=action,
+            reason=reason,
+            details=details,
+        )
     
     def execute_signal(self, signal, data):
         """Place order based on signal. Only acts on signal change (idempotent); caps BUY at MAX_DOLLAR_PER_STOCK."""
@@ -146,11 +164,11 @@ class StrategyExecutor:
         
         print(f"\nCurrent position: {current_position} shares")
         print(f"Signal: {signal}")
+        current_price = float(data['Close'].iloc[-1]) if not data.empty else None
         
         # Signal = 1 (buy), 0 (sell/flat). Only place order when signal changed from last executed.
         if signal == 1 and current_position == 0 and last_signal != 1:
             # Buy: cap at MAX_DOLLAR_PER_STOCK per stock
-            current_price = float(data['Close'].iloc[-1])
             dollar_amount = min(MAX_DOLLAR_PER_STOCK, buying_power * 0.95)
             qty = int(dollar_amount / current_price)
             
@@ -175,8 +193,38 @@ class StrategyExecutor:
                     status=str(order.status),
                     params=self.params,
                 )
+                self._log_execution_event(
+                    ticker=self.ticker,
+                    signal=signal,
+                    action='BUY',
+                    reason='entry_buy_signal',
+                    details={
+                        "current_position": current_position,
+                        "last_executed_signal": last_signal,
+                        "buying_power": buying_power,
+                        "price": current_price,
+                        "qty": qty,
+                        "max_dollar_per_stock": MAX_DOLLAR_PER_STOCK,
+                        "params": self.params,
+                    },
+                )
                 
                 return order
+            self._log_execution_event(
+                ticker=self.ticker,
+                signal=signal,
+                action='NO_TRADE',
+                reason='qty_zero',
+                details={
+                    "current_position": current_position,
+                    "last_executed_signal": last_signal,
+                    "buying_power": buying_power,
+                    "price": current_price,
+                    "computed_qty": qty,
+                    "max_dollar_per_stock": MAX_DOLLAR_PER_STOCK,
+                    "params": self.params,
+                },
+            )
         
         elif signal == 0 and current_position > 0 and last_signal != 0:
             # Sell all
@@ -199,11 +247,47 @@ class StrategyExecutor:
                 status=str(order.status),
                 params=self.params,
             )
+            self._log_execution_event(
+                ticker=self.ticker,
+                signal=signal,
+                action='SELL',
+                reason='exit_sell_signal',
+                details={
+                    "current_position": current_position,
+                    "last_executed_signal": last_signal,
+                    "price": current_price,
+                    "qty": current_position,
+                    "params": self.params,
+                },
+            )
             
             return order
         
         else:
             print("No action needed")
+            if signal == 1 and current_position != 0:
+                reason = 'already_in_position'
+            elif signal == 1 and last_signal == 1:
+                reason = 'signal_unchanged'
+            elif signal == 0 and current_position == 0:
+                reason = 'already_flat'
+            elif signal == 0 and last_signal == 0:
+                reason = 'signal_unchanged'
+            else:
+                reason = 'conditions_not_met'
+            self._log_execution_event(
+                ticker=self.ticker,
+                signal=signal,
+                action='NO_TRADE',
+                reason=reason,
+                details={
+                    "current_position": current_position,
+                    "last_executed_signal": last_signal,
+                    "buying_power": buying_power,
+                    "price": current_price,
+                    "params": self.params,
+                },
+            )
             return None
 
     def execute_signal_pair(self, signal_a, signal_b, data_a, data_b):
@@ -231,6 +315,23 @@ class StrategyExecutor:
         qty_b = int((capital / price_b) * beta) if price_b else 0
         if qty_a <= 0 or qty_b <= 0:
             print("Position size too small; skipping pair trade.")
+            self._log_execution_event(
+                ticker=pair_name,
+                signal=f"{self._serialize_signal(signal_a)},{self._serialize_signal(signal_b)}",
+                action='NO_TRADE',
+                reason='qty_zero',
+                details={
+                    "ticker_a": ticker_a,
+                    "ticker_b": ticker_b,
+                    "qty_a": qty_a,
+                    "qty_b": qty_b,
+                    "price_a": price_a,
+                    "price_b": price_b,
+                    "beta": beta,
+                    "buying_power": buying_power,
+                    "params": self.params,
+                },
+            )
             return None
         # Spread state: long spread = long A short B (pos_a > 0, pos_b < 0); short spread = short A long B
         in_long_spread = pos_a > 0 and pos_b < 0
@@ -249,6 +350,23 @@ class StrategyExecutor:
                 order_b = self.trading_client.submit_order(MarketOrderRequest(symbol=ticker_b, qty=abs(int(pos_b)), side=OrderSide.SELL, time_in_force=TimeInForce.DAY))
             spread_val = np.log(price_a) - beta * np.log(price_b)
             self.db.log_pair_trade(self.strategy.name, pair_name, ticker_a, ticker_b, 'SELL' if in_long_spread else 'BUY', 'BUY' if in_long_spread else 'SELL', abs(pos_a), abs(pos_b), spread_val, None, str(order_a.id), str(order_b.id))
+            self._log_execution_event(
+                ticker=pair_name,
+                signal=f"{self._serialize_signal(signal_a)},{self._serialize_signal(signal_b)}",
+                action='CLOSE_PAIR',
+                reason='exit_to_flat',
+                details={
+                    "ticker_a": ticker_a,
+                    "ticker_b": ticker_b,
+                    "position_a": pos_a,
+                    "position_b": pos_b,
+                    "qty_a": abs(int(pos_a)),
+                    "qty_b": abs(int(pos_b)),
+                    "spread": spread_val,
+                    "beta": beta,
+                    "params": self.params,
+                },
+            )
             print(f"Closed pair: {ticker_a} SELL {abs(int(pos_a))}, {ticker_b} BUY {abs(int(pos_b))}" if in_long_spread else f"Closed pair: {ticker_a} BUY {abs(int(pos_a))}, {ticker_b} SELL {abs(int(pos_b))}")
             return None
         if want_long and not in_long_spread:
@@ -260,6 +378,23 @@ class StrategyExecutor:
             order_b = self.trading_client.submit_order(MarketOrderRequest(symbol=ticker_b, qty=qty_b, side=OrderSide.SELL, time_in_force=TimeInForce.DAY))
             spread_val = np.log(price_a) - beta * np.log(price_b)
             self.db.log_pair_trade(self.strategy.name, pair_name, ticker_a, ticker_b, 'BUY', 'SELL', qty_a, qty_b, spread_val, None, str(order_a.id), str(order_b.id))
+            self._log_execution_event(
+                ticker=pair_name,
+                signal=f"{self._serialize_signal(signal_a)},{self._serialize_signal(signal_b)}",
+                action='OPEN_PAIR',
+                reason='entry_long_spread',
+                details={
+                    "ticker_a": ticker_a,
+                    "ticker_b": ticker_b,
+                    "qty_a": qty_a,
+                    "qty_b": qty_b,
+                    "position_a": pos_a,
+                    "position_b": pos_b,
+                    "spread": spread_val,
+                    "beta": beta,
+                    "params": self.params,
+                },
+            )
             print(f"Long spread: BUY {qty_a} {ticker_a}, SELL {qty_b} {ticker_b}")
             return None
         if want_short and not in_short_spread:
@@ -270,9 +405,55 @@ class StrategyExecutor:
             order_b = self.trading_client.submit_order(MarketOrderRequest(symbol=ticker_b, qty=qty_b, side=OrderSide.BUY, time_in_force=TimeInForce.DAY))
             spread_val = np.log(price_a) - beta * np.log(price_b)
             self.db.log_pair_trade(self.strategy.name, pair_name, ticker_a, ticker_b, 'SELL', 'BUY', qty_a, qty_b, spread_val, None, str(order_a.id), str(order_b.id))
+            self._log_execution_event(
+                ticker=pair_name,
+                signal=f"{self._serialize_signal(signal_a)},{self._serialize_signal(signal_b)}",
+                action='OPEN_PAIR',
+                reason='entry_short_spread',
+                details={
+                    "ticker_a": ticker_a,
+                    "ticker_b": ticker_b,
+                    "qty_a": qty_a,
+                    "qty_b": qty_b,
+                    "position_a": pos_a,
+                    "position_b": pos_b,
+                    "spread": spread_val,
+                    "beta": beta,
+                    "params": self.params,
+                },
+            )
             print(f"Short spread: SELL {qty_a} {ticker_a}, BUY {qty_b} {ticker_b}")
             return None
         print("No pair action needed")
+        if want_flat and not (in_long_spread or in_short_spread):
+            reason = 'already_flat'
+        elif want_long and in_long_spread:
+            reason = 'already_in_target_position'
+        elif want_short and in_short_spread:
+            reason = 'already_in_target_position'
+        else:
+            reason = 'hold_state'
+        self._log_execution_event(
+            ticker=pair_name,
+            signal=f"{self._serialize_signal(signal_a)},{self._serialize_signal(signal_b)}",
+            action='NO_TRADE',
+            reason=reason,
+            details={
+                "ticker_a": ticker_a,
+                "ticker_b": ticker_b,
+                "position_a": pos_a,
+                "position_b": pos_b,
+                "want_long": want_long,
+                "want_short": want_short,
+                "want_flat": want_flat,
+                "in_long_spread": in_long_spread,
+                "in_short_spread": in_short_spread,
+                "price_a": price_a,
+                "price_b": price_b,
+                "beta": beta,
+                "params": self.params,
+            },
+        )
         return None
     
     def run(self):
@@ -299,6 +480,15 @@ class StrategyExecutor:
         print("="*60)
         data = self.get_historical_data()
         print(f"Loaded {len(data)} days of historical data")
+        if data.empty:
+            self._log_execution_event(
+                ticker=self.ticker,
+                signal='N/A',
+                action='NO_TRADE',
+                reason='insufficient_data',
+                details={"rows": 0, "params": self.params},
+            )
+            return
         signals = self.strategy.generate_signals(data)
         current_signal = signals.iloc[-1]
         print(f"Latest signal: {current_signal}")
@@ -315,6 +505,17 @@ class StrategyExecutor:
         print(f"Loaded {len(data_a)} days for {ticker_a}, {len(data_b)} for {ticker_b}")
         if data_a.empty or data_b.empty:
             print("Insufficient data for pair; skipping.")
+            self._log_execution_event(
+                ticker=f"{ticker_a}-{ticker_b}",
+                signal='N/A',
+                action='NO_TRADE',
+                reason='insufficient_data',
+                details={
+                    "rows_a": len(data_a),
+                    "rows_b": len(data_b),
+                    "params": self.params,
+                },
+            )
             return
         signal_a, signal_b = self.strategy.generate_signals(data_a, data_b)
         sa = signal_a.iloc[-1]

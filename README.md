@@ -13,6 +13,7 @@ BackTrace runs the same strategies in two modes: **backtesting** on historical d
 - Multi-strategy and multi-ticker support
 - Automated daily execution at market close (4:30 PM ET)
 - Backtest vs live performance comparison in one interface
+- Execution decision logs (trade + no-trade reasons with diagnostics)
 
 ## Strategies Implemented
 
@@ -107,9 +108,32 @@ cd frontend && npm install && cd ..
    ```
    Runs every weekday at 4:30 PM ET. To test without waiting, uncomment the optional test job in `live/scheduler.py` (runs once shortly after start), then comment it back out for production. Stop with **Ctrl+C**.
 
+### Execution decision logs
+
+The live executor records a decision log on every run, including no-trade outcomes.
+
+- Table: `execution_logs` in the live SQLite DB
+- API: `GET /execution-logs?strategy=Momentum&ticker=AAPL&limit=200`
+- UI: Trades tab -> **Decision Logs**
+
+Common `reason` values:
+
+- `entry_buy_signal` / `exit_sell_signal`: a trade was executed
+- `already_in_position` / `already_flat`: signal did not require a new order
+- `signal_unchanged`: same side was already executed previously
+- `qty_zero`: computed order quantity was 0
+- `insufficient_data`: executor skipped due to missing bars
+- `hold_state` / `already_in_target_position`: pair strategy stayed in current state
+
 ### Deployment
 
 Run the scheduler in the background with a process manager (e.g. systemd, screen, tmux) or a PaaS (e.g. Railway). Ensure the server timezone or cron is set for Eastern Time so the 4:30 PM ET run is correct. For the API and frontend, deploy FastAPI and the React build to your chosen host; keep `live/.env` and the SQLite DB path consistent.
+
+**Railway (API + scheduler in one service):** Use a single service with a volume mounted at `/data` and `DB_PATH=/data/trading.db`. Start command (run from project root so uvicorn can import the app):
+
+```bash
+python live/scheduler.py & exec uvicorn live.api:app --host 0.0.0.0 --port $PORT
+```
 
 **Vercel (frontend):** In Project Settings → Environment Variables, set `REACT_APP_API_URL` to your deployed API URL (e.g. `https://your-api.up.railway.app`). Otherwise the app defaults to `http://localhost:8000`, so visitors get a browser "Access other apps" prompt and the portfolio shows $0 until they allow (and only works if your machine is running the API).
 

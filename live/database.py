@@ -82,6 +82,20 @@ class Database:
                 order_id_b TEXT
             )
         ''')
+
+        # Execution decision logs (includes no-trade reasons)
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS execution_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                strategy TEXT NOT NULL,
+                ticker TEXT NOT NULL,
+                signal TEXT,
+                action TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                details_json TEXT
+            )
+        ''')
         
         conn.commit()
         conn.close()
@@ -307,6 +321,61 @@ class Database:
                 "max_drawdown": row[7],
                 "num_trades": row[8],
                 "equity_curve": equity_curve,
+            })
+        return out
+
+    def log_execution(self, strategy, ticker, signal, action, reason, details=None):
+        """Log execution decision. details is optional dict with full context."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        details_json = json.dumps(details) if details is not None else None
+        cursor.execute('''
+            INSERT INTO execution_logs (timestamp, strategy, ticker, signal, action, reason, details_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (datetime.now().isoformat(), strategy, ticker, signal, action, reason, details_json))
+        conn.commit()
+        conn.close()
+
+    def get_execution_logs(self, strategy=None, ticker=None, limit=200):
+        """Get execution decision logs newest-first with parsed details."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        query = '''
+            SELECT id, timestamp, strategy, ticker, signal, action, reason, details_json
+            FROM execution_logs
+        '''
+        params = []
+        clauses = []
+        if strategy:
+            clauses.append('strategy = ?')
+            params.append(strategy)
+        if ticker:
+            clauses.append('ticker = ?')
+            params.append(ticker)
+        if clauses:
+            query += ' WHERE ' + ' AND '.join(clauses)
+        query += ' ORDER BY timestamp DESC LIMIT ?'
+        params.append(int(limit))
+        cursor.execute(query, params)
+        rows = cursor.fetchall()
+        conn.close()
+        out = []
+        for row in rows:
+            details = None
+            if row[7]:
+                try:
+                    details = json.loads(row[7])
+                except (json.JSONDecodeError, TypeError):
+                    details = None
+            out.append({
+                "id": row[0],
+                "timestamp": row[1],
+                "strategy": row[2],
+                "ticker": row[3],
+                "signal": row[4],
+                "action": row[5],
+                "reason": row[6],
+                "details": details,
             })
         return out
 

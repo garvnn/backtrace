@@ -187,6 +187,14 @@ def get_trades(strategy: str = None):
     return {"trades": trades}
 
 
+@app.get("/execution-logs")
+def get_execution_logs(strategy: str = None, ticker: str = None, limit: int = 200):
+    """Get execution decision logs with optional strategy/ticker filters."""
+    safe_limit = max(1, min(limit, 1000))
+    logs = db.get_execution_logs(strategy=strategy, ticker=ticker, limit=safe_limit)
+    return {"execution_logs": logs}
+
+
 @app.get("/available-pairs/{ticker}")
 def get_pairs_for_ticker(ticker: str):
     """Get list of valid pairs for a ticker."""
