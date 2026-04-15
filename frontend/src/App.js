@@ -1,6 +1,10 @@
-import React, { useState, useEffect, useRef } from 'react';
-import { LineChart, Line, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
+import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
 import './App.css';
+import { Hero } from './dashboard/Hero';
+import { EquityChartPanel } from './dashboard/EquityChartPanel';
+import { AllocationHeatmap } from './dashboard/AllocationHeatmap';
+import { ConfidenceRing } from './dashboard/ConfidenceRing';
 
 const API_BASE =
   process.env.REACT_APP_API_URL ||
@@ -42,7 +46,13 @@ function App() {
   const [tickerFilter, setTickerFilter] = useState('');
   const [activeTab, setActiveTab] = useState('Dashboard');
   const [chartRange, setChartRange] = useState('All'); // '1M' | '3M' | '6M' | '1Y' | 'All'
+  const [chartMode, setChartMode] = useState('equity'); // 'equity' | 'candles'
+  const [candleTicker, setCandleTicker] = useState('AAPL');
+  const [candleBars, setCandleBars] = useState([]);
+  const [candleLoading, setCandleLoading] = useState(false);
+  const [candleError, setCandleError] = useState(null);
   const [strategyHelpOpen, setStrategyHelpOpen] = useState(false);
+  const [headerTime, setHeaderTime] = useState(() => new Date());
   const [positionsSort, setPositionsSort] = useState('pnl'); // 'pnl' | 'ticker'
   const shortMaRef = useRef(null);
   const longMaRef = useRef(null);
@@ -68,6 +78,11 @@ function App() {
     fetchData();
     const interval = setInterval(fetchData, 60000); // Refresh every minute
     return () => clearInterval(interval);
+  }, []);
+
+  useEffect(() => {
+    const t = setInterval(() => setHeaderTime(new Date()), 1000);
+    return () => clearInterval(t);
   }, []);
 
   const fetchData = async () => {
@@ -460,7 +475,7 @@ function App() {
     : null;
   const recentTrades = trades.slice(0, 5);
   // Positions from GET /portfolio; merge in entry_price, current_price, pnl, pnl_pct from GET /positions-detail.
-  const positionsFromPortfolio = (() => {
+  const positionsFromPortfolio = useMemo(() => {
     const p = portfolio?.positions;
     if (!p) return [];
     let rows = Array.isArray(p)
@@ -469,7 +484,9 @@ function App() {
     const detailList = positionsDetail?.positions;
     if (Array.isArray(detailList) && detailList.length > 0) {
       const bySymbol = {};
-      detailList.forEach((d) => { bySymbol[d.symbol] = d; });
+      detailList.forEach((d) => {
+        bySymbol[d.symbol] = d;
+      });
       rows = rows.map((row) => {
         const d = bySymbol[row.symbol];
         if (!d) return row;
@@ -483,8 +500,73 @@ function App() {
       });
     }
     return rows;
-  })();
+  }, [portfolio, positionsDetail]);
   const positionsCount = positionsFromPortfolio.length;
+
+  // Default candle symbol: largest absolute notional when prices exist; else first symbol; else AAPL.
+  const defaultCandleTicker = useMemo(() => {
+    let best = null;
+    let bestVal = 0;
+    for (const r of positionsFromPortfolio) {
+      const px = r.current_price;
+      const q = Number(r.qty ?? 0);
+      if (px != null && px > 0) {
+        const n = Math.abs(q) * px;
+        if (n > bestVal) {
+          bestVal = n;
+          best = r.symbol;
+        }
+      }
+    }
+    if (best) return best;
+    if (positionsFromPortfolio[0]?.symbol) return positionsFromPortfolio[0].symbol;
+    return 'AAPL';
+  }, [positionsFromPortfolio]);
+
+  useEffect(() => {
+    setCandleTicker((prev) => {
+      if (prev === 'AAPL' && defaultCandleTicker && defaultCandleTicker !== 'AAPL') return defaultCandleTicker;
+      return prev;
+    });
+  }, [defaultCandleTicker]);
+
+  useEffect(() => {
+    if (chartMode !== 'candles' || !candleTicker?.trim()) {
+      setCandleBars([]);
+      setCandleError(null);
+      setCandleLoading(false);
+      return undefined;
+    }
+    let cancelled = false;
+    setCandleLoading(true);
+    setCandleError(null);
+    const tr = chartRange === 'All' ? 'ALL' : chartRange;
+    fetch(
+      `${API_BASE}/daily-bars?ticker=${encodeURIComponent(candleTicker.trim())}&time_range=${encodeURIComponent(tr)}`
+    )
+      .then(async (res) => {
+        const data = await res.json();
+        if (!res.ok) {
+          const d = data?.detail;
+          const msg = typeof d === 'string' ? d : Array.isArray(d) ? d.map((x) => x.msg || x).join(', ') : 'Request failed';
+          throw new Error(msg);
+        }
+        if (cancelled) return;
+        setCandleBars(Array.isArray(data.bars) ? data.bars : []);
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          setCandleError(err.message || 'Failed to load daily bars');
+          setCandleBars([]);
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setCandleLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [chartMode, chartRange, candleTicker]);
 
   const tabs = [
     { id: 'Dashboard', label: 'Dashboard' },
@@ -517,7 +599,9 @@ function App() {
             </button>
           ))}
         </nav>
-        <div className="header-right" aria-hidden="true" />
+        <div className="header-clock" title="Local time">
+          {headerTime.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+        </div>
       </header>
 
       {error && (
@@ -819,68 +903,60 @@ function App() {
 
         {activeTab === 'Dashboard' && (
           <div className="dashboard-grid" style={{ paddingTop: 0 }}>
-            {/* Hero */}
-            <div className="hero" style={{ gridColumn: '1 / -1' }}>
-              {loading && !portfolio && !performance ? (
-                <>
-                  <div className="skeleton skeleton-hero-value" style={{ marginBottom: '1rem' }} />
-                  <div className="hero-secondary">
-                    {[1, 2, 3, 4].map((i) => <div key={i} className="skeleton skeleton-hero-stat" />)}
-                  </div>
-                </>
-              ) : (
-                <>
-                  <div className="hero-primary">
-                    <span className="hero-value">
-                      {formatCurrency(portfolio?.portfolio_value ?? performance?.current_value ?? 0)}
-                    </span>
-                    {performance && (
-                      <span className={`hero-return ${(performance.total_return ?? 0) >= 0 ? 'positive' : 'negative'}`}>
-                        {formatPercentSigned(performance.total_return ?? 0)}
-                      </span>
-                    )}
-                  </div>
-                  <div className="hero-secondary">
-                    <span className="hero-stat"><strong>Cash</strong> {formatCurrency(portfolio?.cash ?? 0)}</span>
-                    <span className="hero-stat"><strong>Positions</strong> {positionsCount}</span>
-                    {pairs.length > 0 && <span className="hero-stat"><strong>Pairs</strong> {pairs.length}</span>}
-                    {daysRunning != null && <span className="hero-stat"><strong>Days running</strong> {daysRunning}</span>}
-                    <span className="hero-stat"><strong>Strategy</strong> {portfolio?.strategy ?? '—'}</span>
-                    {portfolio?.timestamp && <span className="hero-stat"><strong>Last updated</strong> {timeAgo(portfolio.timestamp)}</span>}
-                  </div>
-                </>
-              )}
+            <div style={{ gridColumn: '1 / -1' }}>
+              <Hero
+                loading={loading}
+                portfolio={portfolio}
+                performance={performance}
+                formatCurrency={formatCurrency}
+                formatPercentSigned={formatPercentSigned}
+                timeAgo={timeAgo}
+                positionsCount={positionsCount}
+                pairsCount={pairs.length}
+                daysRunning={daysRunning}
+                history={history}
+              />
             </div>
 
             <div className="dashboard-main">
-              {/* Equity Curve */}
-              <div className="card">
-                <h2>Equity Curve</h2>
-                <div className="chart-range">
-                  {['1M', '3M', '6M', '1Y', 'All'].map((r) => (
-                    <button key={r} type="button" className={`chart-range-btn ${chartRange === r ? 'active' : ''}`} onClick={() => setChartRange(r)}>{r}</button>
-                  ))}
+              <EquityChartPanel
+                chartMode={chartMode}
+                setChartMode={setChartMode}
+                chartRange={chartRange}
+                setChartRange={setChartRange}
+                chartData={chartData}
+                candleTicker={candleTicker}
+                setCandleTicker={setCandleTicker}
+                candleBars={candleBars}
+                candleLoading={candleLoading}
+                candleError={candleError}
+                loading={loading}
+                backtestResult={backtestResult}
+                formatCurrency={formatCurrency}
+                onRequestBacktest={() => setActiveTab('Backtest')}
+              />
+
+              <div className="dashboard-widgets-row">
+                <div className="card">
+                  <h2>Allocation</h2>
+                  {loading && !portfolio ? (
+                    <div className="skeleton skeleton-widget" />
+                  ) : (
+                    <AllocationHeatmap positions={positionsFromPortfolio} formatPercent={formatPercent} />
+                  )}
                 </div>
-                {loading && history.length === 0 && !backtestResult ? (
-                  <div className="loading-placeholder chart-placeholder" style={{ minHeight: 320 }}><div className="skeleton skeleton-line" style={{ height: 320 }} /></div>
-                ) : chartData.length > 0 ? (
-                  <ResponsiveContainer width="100%" height={360}>
-                    <LineChart data={chartData} margin={{ top: 8, right: 8, left: 8, bottom: 8 }}>
-                      <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
-                      <XAxis dataKey="timestamp" tickFormatter={(ts) => (ts ? new Date(ts).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: '2-digit' }) : '')} stroke="var(--text-secondary)" />
-                      <YAxis tickFormatter={(v) => v != null ? `$${(v / 1000).toFixed(0)}k` : ''} stroke="var(--text-secondary)" />
-                      <Tooltip formatter={(value) => value != null ? formatCurrency(value) : '—'} labelFormatter={(label) => label ? new Date(label).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' }) : ''} contentStyle={{ background: 'var(--card)', border: '1px solid var(--border)', borderRadius: 8 }} />
-                      <Legend />
-                      <Line type="monotone" dataKey="portfolio_value" stroke="var(--accent)" strokeWidth={2} name="Live" connectNulls={false} dot={false} />
-                      <Line type="monotone" dataKey="backtest_value" stroke="var(--text-secondary)" strokeWidth={2} strokeDasharray="5 5" name="Backtest" connectNulls={false} dot={false} />
-                    </LineChart>
-                  </ResponsiveContainer>
-                ) : (
-                  <div className="empty-state chart-placeholder" style={{ minHeight: 320 }}>
-                    <p>No backtest data yet. Run your first backtest to see strategy performance and compare live vs historical.</p>
-                    <button type="button" className="empty-state-cta" onClick={() => setActiveTab('Backtest')}>Run your first backtest →</button>
-                  </div>
-                )}
+                <div className="card">
+                  <h2>Strategy outlook</h2>
+                  {loading && !performance && !monteCarloData ? (
+                    <div className="skeleton skeleton-widget" style={{ minHeight: 220 }} />
+                  ) : (
+                    <ConfidenceRing
+                      monteCarloData={monteCarloData}
+                      liveSharpe={liveSharpe}
+                      historyLength={history.length}
+                    />
+                  )}
+                </div>
               </div>
 
               {/* Backtest vs Live */}
@@ -891,23 +967,45 @@ function App() {
                     <table className="comparison-table">
                       <thead><tr><th>Metric</th><th>Backtest</th><th>Live</th><th>Gap</th></tr></thead>
                       <tbody>
-                        <tr>
+                        <tr
+                          className={
+                            (performance.total_return ?? 0) - (backtestResult.total_return ?? 0) >= 0
+                              ? 'row-profit-zone'
+                              : 'row-loss-zone'
+                          }
+                        >
                           <td>Total Return</td>
-                          <td className={(backtestResult.total_return ?? 0) >= 0 ? 'num-positive' : 'num-negative'}>{formatPercentSigned(backtestResult.total_return ?? 0)}</td>
-                          <td className={(performance.total_return ?? 0) >= 0 ? 'num-positive' : 'num-negative'}>{formatPercentSigned(performance.total_return ?? 0)}</td>
-                          <td className={((performance.total_return ?? 0) - (backtestResult.total_return ?? 0)) >= 0 ? 'num-positive' : 'num-negative'}>{formatPercentSigned((performance.total_return ?? 0) - (backtestResult.total_return ?? 0))}</td>
+                          <td className={`num-mono ${(backtestResult.total_return ?? 0) >= 0 ? 'num-positive' : 'num-negative'}`}>{formatPercentSigned(backtestResult.total_return ?? 0)}</td>
+                          <td className={`num-mono ${(performance.total_return ?? 0) >= 0 ? 'num-positive' : 'num-negative'}`}>{formatPercentSigned(performance.total_return ?? 0)}</td>
+                          <td className={`num-mono ${((performance.total_return ?? 0) - (backtestResult.total_return ?? 0)) >= 0 ? 'num-positive' : 'num-negative'}`}>{formatPercentSigned((performance.total_return ?? 0) - (backtestResult.total_return ?? 0))}</td>
                         </tr>
-                        <tr>
+                        <tr
+                          className={
+                            (() => {
+                              const g = liveSharpe != null && backtestResult.sharpe_ratio != null ? liveSharpe - backtestResult.sharpe_ratio : null;
+                              if (g == null) return '';
+                              return g >= 0 ? 'row-profit-zone' : 'row-loss-zone';
+                            })()
+                          }
+                        >
                           <td>Sharpe Ratio</td>
-                          <td>{backtestResult.sharpe_ratio != null ? Number(backtestResult.sharpe_ratio).toFixed(2) : '—'}</td>
-                          <td>{liveSharpe != null ? liveSharpe.toFixed(2) : '—'}</td>
-                          <td>{liveSharpe != null && backtestResult.sharpe_ratio != null ? (liveSharpe - backtestResult.sharpe_ratio).toFixed(2) : '—'}</td>
+                          <td className="num-mono">{backtestResult.sharpe_ratio != null ? Number(backtestResult.sharpe_ratio).toFixed(2) : '—'}</td>
+                          <td className="num-mono">{liveSharpe != null ? liveSharpe.toFixed(2) : '—'}</td>
+                          <td className="num-mono">{liveSharpe != null && backtestResult.sharpe_ratio != null ? `${liveSharpe - backtestResult.sharpe_ratio >= 0 ? '↑ ' : '↓ '}${Math.abs(liveSharpe - backtestResult.sharpe_ratio).toFixed(2)}` : '—'}</td>
                         </tr>
-                        <tr>
+                        <tr
+                          className={
+                            (() => {
+                              const g = liveMaxDrawdown != null && backtestResult.max_drawdown != null ? liveMaxDrawdown - backtestResult.max_drawdown : null;
+                              if (g == null) return '';
+                              return g >= 0 ? 'row-profit-zone' : 'row-loss-zone';
+                            })()
+                          }
+                        >
                           <td>Max Drawdown</td>
-                          <td className="num-negative">{formatPercentSigned(backtestResult.max_drawdown ?? 0)}</td>
-                          <td className="num-negative">{liveMaxDrawdown != null ? formatPercentSigned(liveMaxDrawdown) : '—'}</td>
-                          <td>{liveMaxDrawdown != null && backtestResult.max_drawdown != null ? (liveMaxDrawdown - backtestResult.max_drawdown >= 0 ? '+' : '') + formatPercentSigned(liveMaxDrawdown - backtestResult.max_drawdown) : '—'}</td>
+                          <td className="num-mono num-negative">{formatPercentSigned(backtestResult.max_drawdown ?? 0)}</td>
+                          <td className="num-mono num-negative">{liveMaxDrawdown != null ? formatPercentSigned(liveMaxDrawdown) : '—'}</td>
+                          <td className="num-mono">{liveMaxDrawdown != null && backtestResult.max_drawdown != null ? (liveMaxDrawdown - backtestResult.max_drawdown >= 0 ? '+' : '') + formatPercentSigned(liveMaxDrawdown - backtestResult.max_drawdown) : '—'}</td>
                         </tr>
                       </tbody>
                     </table>

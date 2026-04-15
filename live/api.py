@@ -18,7 +18,7 @@ from database import Database
 logger = logging.getLogger(__name__)
 from pairs_config import get_available_pairs, is_valid_pair
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta, date
 import pandas as pd
 from dotenv import load_dotenv
 load_dotenv(os.path.join(LIVE_DIR, ".env"))
@@ -268,6 +268,103 @@ def get_portfolio_history_endpoint(strategy: str = None):
         })
     
     return {"history": history_list}
+
+
+DAILY_BARS_MAX_POINTS = 500
+
+
+def _time_range_to_dates(time_range: str) -> tuple[str, str]:
+    """Return (start_date, end_date) as YYYY-MM-DD, inclusive end."""
+    end = datetime.now(timezone.utc).date()
+    tr = (time_range or "1Y").strip().upper()
+    if tr == "1M":
+        start = end - timedelta(days=32)
+    elif tr == "3M":
+        start = end - timedelta(days=95)
+    elif tr == "6M":
+        start = end - timedelta(days=186)
+    elif tr == "1Y":
+        start = end - timedelta(days=370)
+    elif tr == "ALL":
+        start = end - timedelta(days=365 * 12)
+    else:
+        start = end - timedelta(days=370)
+    return start.isoformat(), end.isoformat()
+
+
+def _downsample_bars(rows: list, max_points: int = DAILY_BARS_MAX_POINTS) -> list:
+    if not rows or len(rows) <= max_points:
+        return rows
+    n = len(rows)
+    step = (n - 1) / (max_points - 1)
+    indices = [0] + [int(round(i * step)) for i in range(1, max_points - 1)] + [n - 1]
+    return [rows[i] for i in indices]
+
+
+@app.get("/daily-bars")
+def get_daily_bars(ticker: str, time_range: str = "1Y"):
+    """Daily OHLCV for candlestick charts. Uses cached Yahoo data via data.loader."""
+    sym = (ticker or "").strip().upper()
+    if not sym:
+        raise HTTPException(status_code=400, detail="ticker is required")
+    start_date, end_inclusive = _time_range_to_dates(time_range)
+    # yfinance `end` is exclusive
+    end_exclusive = (date.fromisoformat(end_inclusive) + timedelta(days=1)).isoformat()
+    old_cwd = os.getcwd()
+    try:
+        os.chdir(PROJECT_ROOT)
+        from data.loader import load_data
+        df = load_data(sym, start_date, end_exclusive)
+    finally:
+        os.chdir(old_cwd)
+    if df is None or len(df) == 0:
+        return {"ticker": sym, "bars": []}
+    colmap = {str(c).lower(): c for c in df.columns}
+
+    def pick(*names):
+        for n in names:
+            if n.lower() in colmap:
+                return colmap[n.lower()]
+        return None
+
+    ocol = pick("Open")
+    hcol = pick("High")
+    lcol = pick("Low")
+    ccol = pick("Close")
+    vcol = pick("Volume")
+    if not all([ocol, hcol, lcol, ccol]):
+        raise HTTPException(status_code=422, detail="OHLC columns missing in market data")
+    rows = []
+    for idx, row in df.iterrows():
+        try:
+            if hasattr(idx, "strftime"):
+                d = idx.strftime("%Y-%m-%d")
+            else:
+                d = str(idx)[:10]
+            o, h, l, c = float(row[ocol]), float(row[hcol]), float(row[lcol]), float(row[ccol])
+            if any(pd.isna(x) for x in (o, h, l, c)):
+                continue
+            vol = None
+            if vcol is not None and pd.notna(row.get(vcol, float("nan"))):
+                try:
+                    vol = float(row[vcol])
+                except (TypeError, ValueError):
+                    vol = None
+            rows.append(
+                {
+                    "date": d,
+                    "open": o,
+                    "high": h,
+                    "low": l,
+                    "close": c,
+                    "volume": vol,
+                }
+            )
+        except (TypeError, ValueError, KeyError):
+            continue
+    rows.sort(key=lambda x: x["date"])
+    rows = _downsample_bars(rows)
+    return {"ticker": sym, "bars": rows}
 
 
 # Starting capital for live paper trading; return % is always from this baseline
