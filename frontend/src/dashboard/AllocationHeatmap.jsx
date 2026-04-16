@@ -3,11 +3,11 @@ import React, { useMemo } from 'react';
 function tileColor(weight, isShort) {
   const t = Math.min(1, Math.max(0, weight));
   if (isShort) {
-    const a = 0.12 + t * 0.38;
-    return `rgba(248, 113, 113, ${a})`;
+    const L = 24 + Math.round(t * 10);
+    return `hsl(0, 9%, ${L}%)`;
   }
-  const a = 0.12 + t * 0.42;
-  return `rgba(52, 211, 153, ${a})`;
+  const L = 26 + Math.round(t * 11);
+  return `hsl(135, 7%, ${L}%)`;
 }
 
 export function AllocationHeatmap({ positions, formatPercent }) {
@@ -64,7 +64,7 @@ export function AllocationHeatmap({ positions, formatPercent }) {
           className="allocation-tile"
           style={{
             background: tileColor(t.weight, t.isShort),
-            borderColor: t.isShort ? 'rgba(248,113,113,0.45)' : 'rgba(52,211,153,0.35)',
+            borderColor: t.isShort ? 'hsl(0, 8%, 32%)' : 'hsl(135, 6%, 32%)',
           }}
         >
           <span className="allocation-tile-symbol">{t.symbol}</span>

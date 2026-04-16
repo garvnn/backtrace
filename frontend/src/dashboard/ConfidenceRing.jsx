@@ -35,19 +35,13 @@ export function ConfidenceRing({ monteCarloData, liveSharpe, historyLength }) {
             cy={c}
             r={r}
             fill="none"
-            stroke="url(#confGrad)"
+            stroke="var(--accent-muted)"
             strokeWidth={stroke}
-            strokeLinecap="round"
+            strokeLinecap="butt"
             strokeDasharray={`${dash} ${circ}`}
             transform={`rotate(-90 ${c} ${c})`}
           />
         )}
-        <defs>
-          <linearGradient id="confGrad" x1="0" y1="0" x2="1" y2="1">
-            <stop offset="0%" stopColor="var(--accent)" />
-            <stop offset="100%" stopColor="var(--positive)" />
-          </linearGradient>
-        </defs>
       </svg>
       {pct != null && <div className="confidence-ring-value">{pct}%</div>}
       <div className="confidence-ring-label">{label}</div>

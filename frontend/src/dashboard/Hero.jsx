@@ -62,7 +62,7 @@ function useAnimatedPortfolioValue(target, initialCapital, enabled) {
       return;
     }
     ranRef.current = true;
-    const duration = 1050;
+    const duration = 480;
     const t0 = performance.now();
     const ease = (t) => 1 - (1 - t) ** 3;
     let frame;
@@ -103,7 +103,7 @@ export function Hero({
 
   if (loading && !portfolio && !performance) {
     return (
-      <div className="hero">
+      <div className="hero hero--loading">
         <div className="skeleton skeleton-hero-value" style={{ marginBottom: 'var(--space-2)' }} />
         <div className="hero-secondary">
           {[1, 2, 3, 4].map((i) => (

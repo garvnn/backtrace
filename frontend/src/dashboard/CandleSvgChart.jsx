@@ -90,20 +90,14 @@ export function CandleSvgChart({ data, formatCurrency, height = 340 }) {
         onMouseMove={onMove}
         onMouseLeave={onLeave}
       >
-        <defs>
-          <linearGradient id="candleGrid" x1="0" y1="0" x2="0" y2="1">
-            <stop offset="0%" stopColor="rgba(130,160,195,0.12)" />
-            <stop offset="100%" stopColor="rgba(130,160,195,0.02)" />
-          </linearGradient>
-        </defs>
-        <rect x={PAD.l} y={PAD.t} width={innerW} height={innerH} fill="url(#candleGrid)" rx={4} />
+        <rect x={PAD.l} y={PAD.t} width={innerW} height={innerH} fill="rgba(255,255,255,0.02)" rx={0} />
         {hover && (
           <line
             x1={hover.xPx}
             x2={hover.xPx}
             y1={PAD.t}
             y2={PAD.t + innerH}
-            stroke="rgba(130,160,195,0.45)"
+            stroke="rgba(255,255,255,0.14)"
             strokeWidth={1}
           />
         )}
@@ -114,8 +108,8 @@ export function CandleSvgChart({ data, formatCurrency, height = 340 }) {
           const yH = yScale(d.high);
           const yL = yScale(d.low);
           const up = d.close >= d.open;
-          const stroke = up ? 'var(--positive)' : 'var(--negative)';
-          const fill = up ? 'rgba(52, 211, 153, 0.45)' : 'rgba(248, 113, 113, 0.45)';
+          const stroke = up ? '#6b8f72' : '#a67b7b';
+          const fill = up ? 'rgba(107, 143, 114, 0.35)' : 'rgba(166, 123, 123, 0.35)';
           const top = Math.min(yO, yC);
           const h = Math.max(1, Math.abs(yC - yO));
           return (

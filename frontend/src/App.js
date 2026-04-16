@@ -893,7 +893,7 @@ function App() {
                 </div>
                 {monteCarloData.histogram_data && monteCarloData.histogram_data.length > 0 && (
                   <ResponsiveContainer width="100%" height={280}>
-                    <BarChart data={monteCarloData.histogram_data}><CartesianGrid strokeDasharray="3 3" stroke="var(--border)" /><XAxis dataKey="bin" tickFormatter={(v) => formatCurrency(v)} stroke="var(--text-secondary)" /><YAxis stroke="var(--text-secondary)" /><Tooltip formatter={(v) => [v, 'Count']} labelFormatter={(l) => formatCurrency(l)} /><Bar dataKey="count" fill="var(--accent)" /></BarChart>
+                    <BarChart data={monteCarloData.histogram_data}><CartesianGrid strokeDasharray="3 3" stroke="var(--border)" /><XAxis dataKey="bin" tickFormatter={(v) => formatCurrency(v)} stroke="var(--text-secondary)" /><YAxis stroke="var(--text-secondary)" /><Tooltip formatter={(v) => [v, 'Count']} labelFormatter={(l) => formatCurrency(l)} /><Bar dataKey="count" fill="#6d7380" /></BarChart>
                   </ResponsiveContainer>
                 )}
               </div>
@@ -1084,9 +1084,9 @@ function App() {
                 {monteCarloData && !monteCarloData.error ? (
                   <>
                     <div className="mc-summary-bar">
-                      <div className="mc-summary-segment" style={{ width: '30%', background: 'var(--negative)' }} title="5th %" />
-                      <div className="mc-summary-segment" style={{ width: '40%', background: 'var(--text-secondary)' }} title="50th %" />
-                      <div className="mc-summary-segment" style={{ width: '30%', background: 'var(--positive)' }} title="95th %" />
+                      <div className="mc-summary-segment" style={{ width: '30%', background: '#5a4a4a' }} title="5th %" />
+                      <div className="mc-summary-segment" style={{ width: '40%', background: '#4a5058' }} title="50th %" />
+                      <div className="mc-summary-segment" style={{ width: '30%', background: '#4a5c4e' }} title="95th %" />
                     </div>
                     <div className="hero-stat"><span className="label">5th / 50th / 95th</span> {formatCurrency(monteCarloData.percentiles?.[5] ?? 0)} / {formatCurrency(monteCarloData.percentiles?.[50] ?? 0)} / {formatCurrency(monteCarloData.percentiles?.[95] ?? 0)}</div>
                     <div className="mc-summary-prob">Probability of profit: {((monteCarloData.probability_profit ?? 0) * 100).toFixed(1)}%</div>

@@ -87,16 +87,6 @@ export function EquityChartPanel({
       {chartMode === 'equity' && annotated.length > 0 ? (
         <ResponsiveContainer width="100%" height={360}>
           <AreaChart data={annotated} margin={{ top: 12, right: 12, left: 4, bottom: 8 }}>
-            <defs>
-              <linearGradient id="liveAreaGradient" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="0%" stopColor="var(--accent)" stopOpacity={0.45} />
-                <stop offset="100%" stopColor="var(--accent)" stopOpacity={0} />
-              </linearGradient>
-              <linearGradient id="btAreaGradient" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="0%" stopColor="var(--text-secondary)" stopOpacity={0.2} />
-                <stop offset="100%" stopColor="var(--text-secondary)" stopOpacity={0} />
-              </linearGradient>
-            </defs>
             <CartesianGrid strokeDasharray="3 3" stroke="var(--chart-grid)" vertical={false} />
             <XAxis
               dataKey="timestamp"
@@ -125,24 +115,24 @@ export function EquityChartPanel({
               type="monotone"
               dataKey="portfolio_value"
               name="Live"
-              stroke="var(--accent)"
-              strokeWidth={2}
-              fill="url(#liveAreaGradient)"
+              stroke="var(--chart-line-live)"
+              strokeWidth={1.5}
+              fill="var(--chart-fill-live)"
               connectNulls={false}
               dot={false}
-              activeDot={{ r: 4, strokeWidth: 0, fill: 'var(--accent)' }}
+              activeDot={{ r: 3, strokeWidth: 1, fill: 'var(--surface-card)', stroke: 'var(--chart-line-live)' }}
             />
             <Area
               type="monotone"
               dataKey="backtest_value"
               name="Backtest"
-              stroke="var(--text-secondary)"
-              strokeWidth={2}
-              strokeDasharray="6 4"
-              fill="url(#btAreaGradient)"
+              stroke="var(--chart-line-bt)"
+              strokeWidth={1.5}
+              strokeDasharray="4 4"
+              fill="var(--chart-fill-bt)"
               connectNulls={false}
               dot={false}
-              activeDot={{ r: 3, strokeWidth: 0, fill: 'var(--text-secondary)' }}
+              activeDot={{ r: 3, strokeWidth: 1, fill: 'var(--surface-card)', stroke: 'var(--chart-line-bt)' }}
             />
           </AreaChart>
         </ResponsiveContainer>
