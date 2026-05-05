@@ -371,6 +371,41 @@ def get_daily_bars(ticker: str, time_range: str = "1Y"):
 INITIAL_CAPITAL = 100_000
 
 
+def _compute_spy_benchmark(start_date: str, end_date: str, initial_capital: float):
+    """
+    SPY buy-and-hold over [start_date, end_date] with same initial capital as the strategy backtest.
+    Returns a JSON-serializable dict or None if data unavailable.
+    """
+    old = os.getcwd()
+    try:
+        os.chdir(PROJECT_ROOT)
+        from data.loader import load_data
+        from engine.backtest_engine import BacktestEngine
+        from analytics.benchmark import equity_series_to_curve_list, metrics_from_equity_series
+
+        spy_df = load_data("SPY", start_date, end_date)
+        if spy_df is None or len(spy_df) == 0:
+            return None
+        engine = BacktestEngine(initial_capital=initial_capital)
+        spy_results = engine.run_buyhold(spy_df)
+        spy_pv = spy_results["portfolio_values"]
+        m = metrics_from_equity_series(spy_pv, initial_capital)
+        curve = equity_series_to_curve_list(spy_pv)
+        return {
+            "symbol": "SPY",
+            "equity_curve": _downsample_equity_curve(curve),
+            "total_return": m["total_return"],
+            "sharpe_ratio": m["sharpe_ratio"],
+            "max_drawdown": m["max_drawdown"],
+            "daily_returns": m["daily_returns"],
+        }
+    except Exception as e:
+        logger.warning("SPY benchmark failed: %s", e)
+        return None
+    finally:
+        os.chdir(old)
+
+
 @app.get("/performance")
 def get_performance(strategy: str = None):
     """Get performance metrics. Total return is always from original 100k capital."""
@@ -439,6 +474,7 @@ def run_backtest(req: BacktestRequest):
                 detail=f"Invalid pair: {ticker}-{ticker_b}. Use preset pairs from the dropdown.",
             )
         pair_ticker = f"{ticker}-{ticker_b}"
+    response_enrichment = {}
     old_cwd = os.getcwd()
     try:
         os.chdir(PROJECT_ROOT)
@@ -460,6 +496,7 @@ def run_backtest(req: BacktestRequest):
             engine = BacktestEngine()
             results = engine.run_pair(data_a, data_b, strategy)
             metrics = calculate_metrics(results)
+            benchmark = _compute_spy_benchmark(start_date, end_date, engine.initial_capital)
             db.save_backtest_results(
                 strategy_name, pair_ticker, start_date, end_date,
                 float(metrics["total_return"]), float(metrics["sharpe_ratio"]),
@@ -481,6 +518,8 @@ def run_backtest(req: BacktestRequest):
                 "sharpe_ratio": float(metrics["sharpe_ratio"]),
                 "max_drawdown": float(metrics["max_drawdown"]),
                 "num_trades": int(metrics["num_trades"]),
+                "avg_return_per_trade": metrics["avg_return_per_trade"],
+                "daily_returns": metrics["daily_returns"],
                 "equity_curve": _downsample_equity_curve(equity_list),
                 "params_used": {
                     "strategy": strategy_name,
@@ -491,6 +530,8 @@ def run_backtest(req: BacktestRequest):
                     "exit_threshold": float(req.exit_threshold) if req.exit_threshold is not None else 0.5,
                 },
             }
+            if benchmark:
+                result["benchmark"] = benchmark
             return result
         data = load_data(ticker, start_date, end_date)
         if data is None or len(data) == 0:
@@ -499,6 +540,11 @@ def run_backtest(req: BacktestRequest):
         engine = BacktestEngine()
         results = engine.run(data, strategy)
         metrics = calculate_metrics(results)
+        response_enrichment["daily_returns"] = metrics["daily_returns"]
+        response_enrichment["avg_return_per_trade"] = metrics["avg_return_per_trade"]
+        b = _compute_spy_benchmark(start_date, end_date, engine.initial_capital)
+        if b:
+            response_enrichment["benchmark"] = b
         db.save_backtest_results(
             strategy_name, ticker, start_date, end_date,
             float(metrics["total_return"]), float(metrics["sharpe_ratio"]),
@@ -520,7 +566,108 @@ def run_backtest(req: BacktestRequest):
         "long_window": req.long_window,
         "lookback_period": req.lookback_period,
     }
+    result.update(response_enrichment)
     return result
+
+
+@app.get("/live-benchmark")
+def get_live_benchmark(strategy: str = None, time_range: str = "1Y"):
+    """
+    Live portfolio history vs SPY (buy & hold) over the same calendar window as `time_range`.
+    Live equity is rebased so the first point in-window equals INITIAL_CAPITAL (same as SPY start).
+    """
+    start_date, end_inclusive = _time_range_to_dates(time_range)
+    history = db.get_portfolio_history(strategy=strategy)
+    points = []
+    for snap in history:
+        ts_raw = snap[1]
+        pv = float(snap[3])
+        d = (ts_raw or "")[:10]
+        if d and start_date <= d <= end_inclusive:
+            points.append({"timestamp": d, "portfolio_value": pv})
+    points.sort(key=lambda x: x["timestamp"])
+    trades = db.get_all_trades(strategy=strategy)
+    num_trades = len(trades)
+
+    if len(points) < 1:
+        return {
+            "start_date": start_date,
+            "end_date": end_inclusive,
+            "time_range": time_range,
+            "live_equity_curve": [],
+            "spy_equity_curve": [],
+            "live": {
+                "total_return": 0.0,
+                "sharpe_ratio": 0.0,
+                "max_drawdown": 0.0,
+                "daily_returns": [],
+                "num_trades": num_trades,
+                "avg_return_per_trade": None,
+            },
+            "spy": None,
+        }
+
+    old_cwd = os.getcwd()
+    try:
+        os.chdir(PROJECT_ROOT)
+        from data.loader import load_data
+        from engine.backtest_engine import BacktestEngine
+        from analytics.benchmark import (
+            equity_series_to_curve_list,
+            metrics_from_equity_series,
+            metrics_from_sparse_equity_points,
+        )
+
+        ts_list = [p["timestamp"] for p in points]
+        val_list = [p["portfolio_value"] for p in points]
+        scale = INITIAL_CAPITAL / val_list[0] if val_list[0] else 1.0
+        scaled_vals = [v * scale for v in val_list]
+        live_curve_full = [
+            {"timestamp": ts_list[i], "portfolio_value": scaled_vals[i]} for i in range(len(points))
+        ]
+        live_curve = _downsample_equity_curve(live_curve_full)
+
+        # yfinance `end` is exclusive — include end_inclusive as last bar
+        end_exclusive = (date.fromisoformat(end_inclusive) + timedelta(days=1)).isoformat()
+        spy_df = load_data("SPY", start_date, end_exclusive)
+        spy_payload = None
+        if spy_df is not None and len(spy_df) > 0:
+            engine = BacktestEngine(initial_capital=INITIAL_CAPITAL)
+            spy_results = engine.run_buyhold(spy_df)
+            spy_pv = spy_results["portfolio_values"]
+            sm = metrics_from_equity_series(spy_pv, INITIAL_CAPITAL)
+            spy_curve_full = equity_series_to_curve_list(spy_pv)
+            spy_payload = {
+                "symbol": "SPY",
+                "total_return": sm["total_return"],
+                "sharpe_ratio": sm["sharpe_ratio"],
+                "max_drawdown": sm["max_drawdown"],
+                "daily_returns": sm["daily_returns"],
+                "equity_curve": _downsample_equity_curve(spy_curve_full),
+            }
+
+        lm = metrics_from_sparse_equity_points(ts_list, scaled_vals, INITIAL_CAPITAL)
+        return {
+            "start_date": start_date,
+            "end_date": end_inclusive,
+            "time_range": time_range,
+            "live_equity_curve": live_curve,
+            "spy_equity_curve": spy_payload["equity_curve"] if spy_payload else [],
+            "live": {
+                "total_return": lm["total_return"],
+                "sharpe_ratio": lm["sharpe_ratio"],
+                "max_drawdown": lm["max_drawdown"],
+                "daily_returns": lm["daily_returns"],
+                "num_trades": num_trades,
+                "avg_return_per_trade": None,
+            },
+            "spy": spy_payload,
+        }
+    except Exception as e:
+        logger.exception("live-benchmark failed: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        os.chdir(old_cwd)
 
 
 @app.get("/backtest-results")

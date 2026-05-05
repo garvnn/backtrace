@@ -24,6 +24,11 @@ def calculate_metrics(results):
     
     # Daily returns
     daily_returns = portfolio_values.pct_change().dropna()
+    daily_returns_list = []
+    for idx, val in daily_returns.items():
+        d = idx.strftime("%Y-%m-%d") if hasattr(idx, "strftime") else str(idx)[:10]
+        if pd.notna(val):
+            daily_returns_list.append({"date": d, "return": float(val)})
     
     # Sharpe Ratio (annualized, assuming 252 trading days)
     if len(daily_returns) > 0 and daily_returns.std() != 0:
@@ -39,13 +44,21 @@ def calculate_metrics(results):
     
     # Win rate (not applicable for buy-hold, placeholder)
     win_rate = 0.0  # Will implement properly when we track individual trades
+
+    trade_returns = results.get('trade_returns') or []
+    if trade_returns:
+        avg_return_per_trade = float(np.mean(trade_returns))
+    else:
+        avg_return_per_trade = None  # unknown / buy-hold / no round trips
     
     return {
         'total_return': results['total_return'],
         'sharpe_ratio': sharpe_ratio,
         'max_drawdown': max_drawdown,
         'win_rate': win_rate,
-        'num_trades': results['trades']
+        'num_trades': results['trades'],
+        'avg_return_per_trade': avg_return_per_trade,
+        'daily_returns': daily_returns_list,
     }
 
 

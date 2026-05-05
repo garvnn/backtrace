@@ -42,7 +42,8 @@ class BacktestEngine:
         return {
             'portfolio_values': portfolio_values,
             'total_return': total_return,
-            'trades': 1  # Just the initial buy
+            'trades': 1,  # Just the initial buy
+            'trade_returns': [],
         }
     
     def run(self, data, strategy):
@@ -63,6 +64,8 @@ class BacktestEngine:
         shares = 0
         portfolio_values = []
         trades = 0
+        entry_invested = None  # cash allocated at buy (for round-trip return)
+        trade_returns = []
         
         for i in range(len(data)):
             price = float(data['Close'].iloc[i])
@@ -70,16 +73,19 @@ class BacktestEngine:
             
             # Execute trades based on signal
             if signal == 1 and shares == 0:  # Buy signal
-                shares = cash / price
-                cost = cash * self.commission
+                entry_invested = cash
+                net = cash * (1 - self.commission)
+                shares = net / price
                 cash = 0
                 trades += 1
             elif signal == 0 and shares > 0:  # Sell signal
-                cash = shares * price
-                cost = cash * self.commission
-                cash -= cost
+                gross = shares * price
+                cash = gross * (1 - self.commission)
                 shares = 0
                 trades += 1
+                if entry_invested is not None and entry_invested > 0:
+                    trade_returns.append((cash - entry_invested) / entry_invested)
+                entry_invested = None
             
             # Calculate portfolio value
             portfolio_value = cash + (shares * price)
@@ -91,7 +97,8 @@ class BacktestEngine:
         return {
             'portfolio_values': portfolio_values,
             'total_return': total_return,
-            'trades': trades
+            'trades': trades,
+            'trade_returns': trade_returns,
         }
 
     def run_pair(self, data_a, data_b, strategy):
@@ -114,7 +121,7 @@ class BacktestEngine:
         data_b = data_b.loc[common].sort_index()
         if len(data_a) < strategy.lookback or len(data_b) < strategy.lookback:
             pv = pd.Series([self.initial_capital] * len(data_a), index=data_a.index)
-            return {'portfolio_values': pv, 'total_return': 0.0, 'trades': 0}
+            return {'portfolio_values': pv, 'total_return': 0.0, 'trades': 0, 'trade_returns': []}
         signal_a, signal_b = strategy.generate_signals_pair(data_a, data_b)
         cash = self.initial_capital
         shares_a = 0.0
@@ -123,7 +130,10 @@ class BacktestEngine:
         portfolio_values = []
         trades = 0
         capital = self.initial_capital
+        entry_pv = None  # portfolio value after opening a spread (for round-trip return)
+        trade_returns = []
         for i in range(len(data_a)):
+            state_before = state
             pa = float(data_a['Close'].iloc[i])
             pb = float(data_b['Close'].iloc[i])
             sa = signal_a.iloc[i]
@@ -164,6 +174,10 @@ class BacktestEngine:
                     cost = (abs(shares_a * pa) + abs(shares_b * pb)) * self.commission
                     cash -= cost
                     shares_a, shares_b = 0.0, 0.0
+                    pv_flat = cash
+                    if entry_pv is not None and entry_pv > 0:
+                        trade_returns.append((pv_flat - entry_pv) / entry_pv)
+                    entry_pv = None
                     notional = capital * 0.5
                     shares_a = -notional / pa
                     shares_b = notional / pb
@@ -185,6 +199,10 @@ class BacktestEngine:
                     cost = (abs(shares_a * pa) + abs(shares_b * pb)) * self.commission
                     cash -= cost
                     shares_a, shares_b = 0.0, 0.0
+                    pv_flat = cash
+                    if entry_pv is not None and entry_pv > 0:
+                        trade_returns.append((pv_flat - entry_pv) / entry_pv)
+                    entry_pv = None
                     notional = capital * 0.5
                     shares_a = notional / pa
                     shares_b = -notional / pb
@@ -195,12 +213,22 @@ class BacktestEngine:
                     trades += 2
             portfolio_value = cash + shares_a * pa + shares_b * pb
             portfolio_values.append(portfolio_value)
+            if state_before != 'flat' and state == 'flat':
+                if entry_pv is not None and entry_pv > 0:
+                    trade_returns.append((portfolio_value - entry_pv) / entry_pv)
+                entry_pv = None
+            elif state_before == 'flat' and state != 'flat':
+                entry_pv = portfolio_value
+            elif state_before != 'flat' and state != 'flat' and state_before != state:
+                # reversal: new entry_pv is mark-to-market at end of bar
+                entry_pv = portfolio_value
         portfolio_values = pd.Series(portfolio_values, index=data_a.index)
         total_return = (float(portfolio_values.iloc[-1]) / self.initial_capital) - 1
         return {
             'portfolio_values': portfolio_values,
             'total_return': total_return,
-            'trades': trades
+            'trades': trades,
+            'trade_returns': trade_returns,
         }
 
 if __name__ == "__main__":

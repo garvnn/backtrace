@@ -3,6 +3,7 @@ import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContaine
 import './App.css';
 import { Hero } from './dashboard/Hero';
 import { EquityChartPanel } from './dashboard/EquityChartPanel';
+import { BenchmarkPanel } from './dashboard/BenchmarkPanel';
 import { AllocationHeatmap } from './dashboard/AllocationHeatmap';
 import { ConfidenceRing } from './dashboard/ConfidenceRing';
 
@@ -54,6 +55,9 @@ function App() {
   const [strategyHelpOpen, setStrategyHelpOpen] = useState(false);
   const [headerTime, setHeaderTime] = useState(() => new Date());
   const [positionsSort, setPositionsSort] = useState('pnl'); // 'pnl' | 'ticker'
+  const [liveBenchmark, setLiveBenchmark] = useState(null);
+  const [liveBenchmarkLoading, setLiveBenchmarkLoading] = useState(false);
+  const [liveBenchmarkError, setLiveBenchmarkError] = useState(null);
   const shortMaRef = useRef(null);
   const longMaRef = useRef(null);
   const lookbackRef = useRef(null);
@@ -583,6 +587,31 @@ function App() {
     return () => { document.title = 'BackTrace Live'; };
   }, [portfolio?.portfolio_value, performance?.current_value]);
 
+  useEffect(() => {
+    if (activeTab !== 'Portfolio') return undefined;
+    let cancelled = false;
+    const tr = chartRange === 'All' ? 'ALL' : chartRange;
+    setLiveBenchmarkLoading(true);
+    setLiveBenchmarkError(null);
+    fetch(`${API_BASE}/live-benchmark?time_range=${encodeURIComponent(tr)}`)
+      .then((res) => {
+        if (!res.ok) throw new Error('Failed to load benchmark');
+        return res.json();
+      })
+      .then((data) => {
+        if (!cancelled) setLiveBenchmark(data);
+      })
+      .catch((err) => {
+        if (!cancelled) setLiveBenchmarkError(err.message || 'Benchmark error');
+      })
+      .finally(() => {
+        if (!cancelled) setLiveBenchmarkLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeTab, chartRange]);
+
   return (
     <div className="App">
       <header>
@@ -613,66 +642,78 @@ function App() {
 
       <div className="container">
         {activeTab === 'Portfolio' && (
-          <div className="card portfolio-tab-card">
-            <h2>Current Portfolio</h2>
-            {portfolio != null && (
-              <>
-                <div className="portfolio-tab-summary">
-                  <div className="portfolio-tab-value">
-                    <span className="label">Portfolio Value</span>
-                    <span className="value">{formatCurrency(portfolio.portfolio_value ?? 0)}</span>
+          <>
+            <div className="card portfolio-tab-card">
+              <h2>Current Portfolio</h2>
+              {portfolio != null && (
+                <>
+                  <div className="portfolio-tab-summary">
+                    <div className="portfolio-tab-value">
+                      <span className="label">Portfolio Value</span>
+                      <span className="value">{formatCurrency(portfolio.portfolio_value ?? 0)}</span>
+                    </div>
+                    <div className="portfolio-tab-cash">
+                      <span className="label">Cash</span>
+                      <span className="value">{formatCurrency(portfolio.cash ?? 0)}</span>
+                    </div>
                   </div>
-                  <div className="portfolio-tab-cash">
-                    <span className="label">Cash</span>
-                    <span className="value">{formatCurrency(portfolio.cash ?? 0)}</span>
-                  </div>
-                </div>
-                {portfolio.timestamp && (
-                  <p className="portfolio-last-update">Last updated: {timeAgo(portfolio.timestamp)}</p>
-                )}
-                <div className="positions-table-wrap">
-                  <div className="positions-sort">
-                    <span>Sort by:</span>
-                    <button type="button" className={positionsSort === 'ticker' ? 'active' : ''} onClick={() => setPositionsSort('ticker')}>Ticker</button>
-                    <button type="button" className={positionsSort === 'pnl' ? 'active' : ''} onClick={() => setPositionsSort('pnl')}>P&L</button>
-                  </div>
-                  <table className="positions-detail-table">
-                    <thead>
-                      <tr>
-                        <th>Ticker</th>
-                        <th>Qty</th>
-                        <th>Entry Price</th>
-                        <th>Current Price</th>
-                        <th>P&L</th>
-                        <th>P&L %</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {[...positionsFromPortfolio]
-                        .sort((a, b) => positionsSort === 'ticker'
-                          ? (a.symbol || '').localeCompare(b.symbol || '')
-                          : (b.pnl ?? 0) - (a.pnl ?? 0))
-                        .map((row) => (
-                          <tr key={row.symbol}>
-                            <td><strong>{row.symbol}</strong></td>
-                            <td>{row.qty}</td>
-                            <td>{row.entry_price != null ? formatCurrency(row.entry_price) : '—'}</td>
-                            <td>{row.current_price != null ? formatCurrency(row.current_price) : '—'}</td>
-                            <td className={(row.pnl ?? 0) >= 0 ? 'positive' : 'negative'}>{row.pnl != null ? formatCurrency(row.pnl) : '—'}</td>
-                            <td className={(row.pnl_pct ?? 0) >= 0 ? 'positive' : 'negative'}>{row.pnl_pct != null ? formatPercent(row.pnl_pct) : '—'}</td>
-                          </tr>
-                        ))}
-                    </tbody>
-                  </table>
-                  {positionsFromPortfolio.length === 0 && (
-                    <p className="empty-placeholder">No open positions.</p>
+                  {portfolio.timestamp && (
+                    <p className="portfolio-last-update">Last updated: {timeAgo(portfolio.timestamp)}</p>
                   )}
-                </div>
-              </>
-            )}
-            {portfolio == null && !loading && <p className="empty-placeholder">Unable to load portfolio.</p>}
-            {loading && portfolio == null && <div className="loading-placeholder">Loading…</div>}
-          </div>
+                  <div className="positions-table-wrap">
+                    <div className="positions-sort">
+                      <span>Sort by:</span>
+                      <button type="button" className={positionsSort === 'ticker' ? 'active' : ''} onClick={() => setPositionsSort('ticker')}>Ticker</button>
+                      <button type="button" className={positionsSort === 'pnl' ? 'active' : ''} onClick={() => setPositionsSort('pnl')}>P&L</button>
+                    </div>
+                    <table className="positions-detail-table">
+                      <thead>
+                        <tr>
+                          <th>Ticker</th>
+                          <th>Qty</th>
+                          <th>Entry Price</th>
+                          <th>Current Price</th>
+                          <th>P&L</th>
+                          <th>P&L %</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {[...positionsFromPortfolio]
+                          .sort((a, b) => positionsSort === 'ticker'
+                            ? (a.symbol || '').localeCompare(b.symbol || '')
+                            : (b.pnl ?? 0) - (a.pnl ?? 0))
+                          .map((row) => (
+                            <tr key={row.symbol}>
+                              <td><strong>{row.symbol}</strong></td>
+                              <td>{row.qty}</td>
+                              <td>{row.entry_price != null ? formatCurrency(row.entry_price) : '—'}</td>
+                              <td>{row.current_price != null ? formatCurrency(row.current_price) : '—'}</td>
+                              <td className={(row.pnl ?? 0) >= 0 ? 'positive' : 'negative'}>{row.pnl != null ? formatCurrency(row.pnl) : '—'}</td>
+                              <td className={(row.pnl_pct ?? 0) >= 0 ? 'positive' : 'negative'}>{row.pnl_pct != null ? formatPercent(row.pnl_pct) : '—'}</td>
+                            </tr>
+                          ))}
+                      </tbody>
+                    </table>
+                    {positionsFromPortfolio.length === 0 && (
+                      <p className="empty-placeholder">No open positions.</p>
+                    )}
+                  </div>
+                </>
+              )}
+              {portfolio == null && !loading && <p className="empty-placeholder">Unable to load portfolio.</p>}
+              {loading && portfolio == null && <div className="loading-placeholder">Loading…</div>}
+            </div>
+            <BenchmarkPanel
+              chartRange={chartRange}
+              setChartRange={setChartRange}
+              liveBenchmark={liveBenchmark}
+              liveLoading={liveBenchmarkLoading}
+              liveError={liveBenchmarkError}
+              backtestResult={backtestResult}
+              formatCurrency={formatCurrency}
+              formatPercent={formatPercent}
+            />
+          </>
         )}
 
         {activeTab === 'Trades' && (

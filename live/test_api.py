@@ -220,6 +220,19 @@ def test_backtest_post():
     return True
 
 
+def test_live_benchmark():
+    """GET /live-benchmark - returns structure (may have empty curves)."""
+    from fastapi.testclient import TestClient
+    app = get_app_with_test_db()
+    client = TestClient(app)
+    r = client.get("/live-benchmark?time_range=1Y")
+    assert r.status_code == 200
+    data = r.json()
+    assert "live" in data and "live_equity_curve" in data
+    assert "spy" in data or data.get("spy") is None
+    return True
+
+
 def test_run_executor_requires_ticker():
     """POST /run-executor - without Stat Arb pair can run (or 400 if keys missing)."""
     from fastapi.testclient import TestClient
@@ -258,6 +271,7 @@ def main():
         ("DELETE /trades/99999 (404)", test_delete_trade_404),
         ("CORS", test_cors_headers),
         ("POST /backtest", test_backtest_post),
+        ("GET /live-benchmark", test_live_benchmark),
         ("POST /run-executor", test_run_executor_requires_ticker),
         ("GET /positions-detail", test_positions_detail),
     ]
