@@ -594,15 +594,36 @@ function App() {
     setLiveBenchmarkLoading(true);
     setLiveBenchmarkError(null);
     fetch(`${API_BASE}/live-benchmark?time_range=${encodeURIComponent(tr)}`)
-      .then((res) => {
-        if (!res.ok) throw new Error('Failed to load benchmark');
-        return res.json();
+      .then(async (res) => {
+        const text = await res.text();
+        let body = null;
+        try {
+          body = text ? JSON.parse(text) : null;
+        } catch {
+          body = null;
+        }
+        if (!res.ok) {
+          const detail =
+            body && typeof body.detail === 'string'
+              ? body.detail
+              : body && body.detail != null
+                ? JSON.stringify(body.detail)
+                : text
+                  ? text.slice(0, 280)
+                  : '';
+          const suffix = detail ? `: ${detail}` : '';
+          throw new Error(`Benchmark request failed (${res.status})${suffix}`);
+        }
+        return body;
       })
       .then((data) => {
         if (!cancelled) setLiveBenchmark(data);
       })
       .catch((err) => {
-        if (!cancelled) setLiveBenchmarkError(err.message || 'Benchmark error');
+        if (!cancelled) {
+          setLiveBenchmark(null);
+          setLiveBenchmarkError(err.message || 'Benchmark error');
+        }
       })
       .finally(() => {
         if (!cancelled) setLiveBenchmarkLoading(false);

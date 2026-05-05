@@ -27,6 +27,34 @@ function mergeCurves(curveA, curveB) {
   }));
 }
 
+/** Forward-fill each series so downsampled curves (different dates) still draw continuous lines. */
+function forwardFillTwoSeries(rows) {
+  let lastA = null;
+  let lastB = null;
+  return rows.map((r) => {
+    if (r.series_a != null && Number.isFinite(r.series_a)) lastA = r.series_a;
+    if (r.series_b != null && Number.isFinite(r.series_b)) lastB = r.series_b;
+    return {
+      ...r,
+      series_a: r.series_a != null ? r.series_a : lastA,
+      series_b: r.series_b != null ? r.series_b : lastB,
+    };
+  });
+}
+
+/** Same cutoff as Dashboard `chartData` in App.js */
+function filterByChartRange(rows, chartRange) {
+  if (!chartRange || chartRange === 'All') return rows;
+  const now = new Date();
+  const cut = new Date(now);
+  if (chartRange === '1M') cut.setMonth(cut.getMonth() - 1);
+  else if (chartRange === '3M') cut.setMonth(cut.getMonth() - 3);
+  else if (chartRange === '6M') cut.setMonth(cut.getMonth() - 6);
+  else if (chartRange === '1Y') cut.setFullYear(cut.getFullYear() - 1);
+  const cutStr = cut.toISOString().slice(0, 10);
+  return rows.filter((d) => (d.timestamp || '') >= cutStr);
+}
+
 function BenchmarkTooltip({ active, payload, label, formatCurrency }) {
   if (!active || !payload?.length) return null;
   const row = payload[0]?.payload;
@@ -58,25 +86,27 @@ export function BenchmarkPanel({
   formatCurrency,
   formatPercent,
 }) {
-  const liveVsSpyData = useMemo(
-    () =>
-      mergeCurves(liveBenchmark?.live_equity_curve, liveBenchmark?.spy_equity_curve).map((d) => ({
-        ...d,
-        live_value: d.series_a,
-        spy_value: d.series_b,
-      })),
-    [liveBenchmark]
-  );
+  const liveVsSpyData = useMemo(() => {
+    const merged = forwardFillTwoSeries(
+      mergeCurves(liveBenchmark?.live_equity_curve, liveBenchmark?.spy_equity_curve)
+    );
+    return merged.map((d) => ({
+      ...d,
+      live_value: d.series_a,
+      spy_value: d.series_b,
+    }));
+  }, [liveBenchmark]);
 
   const backtestVsSpyData = useMemo(() => {
     const strat = backtestResult?.equity_curve;
     const spy = backtestResult?.benchmark?.equity_curve;
-    return mergeCurves(strat, spy).map((d) => ({
+    const merged = forwardFillTwoSeries(mergeCurves(strat, spy)).map((d) => ({
       ...d,
       strategy_value: d.series_a,
       spy_bt_value: d.series_b,
     }));
-  }, [backtestResult]);
+    return filterByChartRange(merged, chartRange);
+  }, [backtestResult, chartRange]);
 
   const liveM = liveBenchmark?.live;
   const spyM = liveBenchmark?.spy;
@@ -103,42 +133,58 @@ export function BenchmarkPanel({
         </div>
       </div>
 
-      {liveError && <div className="chart-error">{liveError}</div>}
-
       <div className="benchmark-metrics-grid">
         <div className="benchmark-metric-block">
           <h3>Live (window)</h3>
-          {liveLoading && !liveM ? (
+          {liveError ? (
+            <p className="chart-error" style={{ fontSize: '0.9rem', lineHeight: 1.45 }}>
+              <strong>Benchmark request failed.</strong> Set <code className="num-mono">REACT_APP_API_URL</code> on Vercel to your
+              Railway API and redeploy the API so <code className="num-mono">GET /live-benchmark</code> is available.
+              <br />
+              <span className="num-mono" style={{ display: 'block', marginTop: '0.5rem' }}>
+                {liveError}
+              </span>
+            </p>
+          ) : liveLoading && !liveM ? (
             <p className="empty-placeholder">Loading…</p>
           ) : liveM ? (
-            <ul className="benchmark-metric-list">
-              <li>
-                <span>Total return</span> <strong className="num-mono">{formatPercent(liveM.total_return ?? 0)}</strong>
-              </li>
-              <li>
-                <span>Sharpe</span> <strong className="num-mono">{(liveM.sharpe_ratio ?? 0).toFixed(2)}</strong>
-              </li>
-              <li>
-                <span>Max drawdown</span>{' '}
-                <strong className="num-mono">{formatPercent(liveM.max_drawdown ?? 0)}</strong>
-              </li>
-              <li>
-                <span>Trades</span> <strong className="num-mono">{liveM.num_trades ?? '—'}</strong>
-              </li>
-              <li>
-                <span>Avg return / trade</span>{' '}
-                <strong className="num-mono">
-                  {liveM.avg_return_per_trade != null ? formatPercent(liveM.avg_return_per_trade) : 'N/A'}
-                </strong>
-              </li>
-            </ul>
+            <>
+              {liveM.no_history ? (
+                <p className="empty-placeholder" style={{ marginBottom: '0.75rem' }}>
+                  No portfolio snapshots in the database for this range. SPY metrics still reflect the market window.
+                </p>
+              ) : null}
+              <ul className="benchmark-metric-list">
+                <li>
+                  <span>Total return</span> <strong className="num-mono">{formatPercent(liveM.total_return ?? 0)}</strong>
+                </li>
+                <li>
+                  <span>Sharpe</span> <strong className="num-mono">{(liveM.sharpe_ratio ?? 0).toFixed(2)}</strong>
+                </li>
+                <li>
+                  <span>Max drawdown</span>{' '}
+                  <strong className="num-mono">{formatPercent(liveM.max_drawdown ?? 0)}</strong>
+                </li>
+                <li>
+                  <span>Trades</span> <strong className="num-mono">{liveM.num_trades ?? '—'}</strong>
+                </li>
+                <li>
+                  <span>Avg return / trade</span>{' '}
+                  <strong className="num-mono">
+                    {liveM.avg_return_per_trade != null ? formatPercent(liveM.avg_return_per_trade) : 'N/A'}
+                  </strong>
+                </li>
+              </ul>
+            </>
           ) : (
             <p className="empty-placeholder">No portfolio history in this range.</p>
           )}
         </div>
         <div className="benchmark-metric-block">
           <h3>SPY (same window)</h3>
-          {!spyM ? (
+          {liveError ? (
+            <p className="empty-placeholder">—</p>
+          ) : !spyM ? (
             <p className="empty-placeholder">{liveLoading ? 'Loading…' : 'No SPY data.'}</p>
           ) : (
             <ul className="benchmark-metric-list">
