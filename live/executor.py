@@ -4,13 +4,15 @@ Strategy executor - runs BackTrace strategies live.
 
 import os
 import sys
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, PROJECT_ROOT)
 
 from dotenv import load_dotenv
 from alpaca.trading.client import TradingClient
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
+from alpaca.data.enums import Adjustment
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 from datetime import datetime, timedelta
@@ -22,15 +24,17 @@ from strategies.mean_reversion import MeanReversionStrategy
 from strategies.stat_arb import StatArbStrategy
 
 from database import Database
+from trading_constants import (
+    MAX_DOLLAR_PER_STOCK,
+    BUYING_POWER_FRACTION,
+    PAIR_CAPITAL_FRACTION,
+)
 
 # Load .env from live/ so it works when run as "python live/executor.py" from project root
 LIVE_DIR = os.path.dirname(os.path.abspath(__file__))
 _env_path = os.path.join(LIVE_DIR, ".env")
 load_dotenv(_env_path)
 DB_PATH = os.getenv("DB_PATH") or os.path.join(LIVE_DIR, "trading.db")
-
-# Cap per-stock position size for single-ticker strategies (10 stocks = max 100k)
-MAX_DOLLAR_PER_STOCK = 10_000
 
 def _bars_to_backtrace_df(df_one):
     """Convert Alpaca bars DataFrame (single symbol) to BackTrace format: Date index, Open/High/Low/Close/Volume."""
@@ -71,7 +75,8 @@ class StrategyExecutor:
         request = StockBarsRequest(
             symbol_or_symbols=syms,
             timeframe=TimeFrame.Day,
-            start=datetime.now() - timedelta(days=days)
+            start=datetime.now() - timedelta(days=days),
+            adjustment=Adjustment.ALL,
         )
         bars = self.data_client.get_stock_bars(request)
         df = getattr(bars, 'df', pd.DataFrame())
@@ -169,7 +174,7 @@ class StrategyExecutor:
         # Signal = 1 (buy), 0 (sell/flat). Only place order when signal changed from last executed.
         if signal == 1 and current_position == 0 and last_signal != 1:
             # Buy: cap at MAX_DOLLAR_PER_STOCK per stock
-            dollar_amount = min(MAX_DOLLAR_PER_STOCK, buying_power * 0.95)
+            dollar_amount = min(MAX_DOLLAR_PER_STOCK, buying_power * BUYING_POWER_FRACTION)
             qty = int(dollar_amount / current_price)
             
             if qty > 0:
@@ -302,7 +307,7 @@ class StrategyExecutor:
         account = self.trading_client.get_account()
         buying_power = float(account.buying_power)
         # Use half of allocated capital for the pair (equal dollar legs)
-        capital = buying_power * 0.45
+        capital = buying_power * PAIR_CAPITAL_FRACTION
         lookback = getattr(self.strategy, 'lookback', 60)
         if len(data_a) >= lookback and len(data_b) >= lookback:
             pa = data_a['Close'].iloc[-lookback:].values.astype(float)

@@ -25,7 +25,8 @@ def load_data(ticker, start_date, end_date):
     os.makedirs(CACHE_DIR, exist_ok=True)
     
     # Check if data is already cached
-    cache_file = os.path.join(CACHE_DIR, f"{ticker}_{start_date}_{end_date}.csv")
+    # Suffix _adj: auto-adjusted OHLC (split/dividend) for parity with live Alpaca adjustment=all
+    cache_file = os.path.join(CACHE_DIR, f"{ticker}_{start_date}_{end_date}_adj.csv")
     
     if os.path.exists(cache_file):
         print(f"Loading {ticker} from cache...")
@@ -33,7 +34,7 @@ def load_data(ticker, start_date, end_date):
         df = df.apply(pd.to_numeric, errors='coerce')
     else:
         print(f"Downloading {ticker} from Yahoo Finance...")
-        df = yf.download(ticker, start=start_date, end=end_date, progress=False)
+        df = yf.download(ticker, start=start_date, end=end_date, progress=False, auto_adjust=True)
 
         # Flatten multi-index columns if they exist
         if isinstance(df.columns, pd.MultiIndex):

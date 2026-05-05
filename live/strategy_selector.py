@@ -1,8 +1,8 @@
 """
-Strategy selector for live trading: pick Momentum vs Mean Reversion per ticker using profit probability.
+Strategy selector for live trading: pick Momentum vs Mean Reversion per ticker.
 
-Used by the scheduler to run one strategy per ticker per day (the one with higher profit probability
-over a short lookback backtest). Stat Arb is not used in live; it remains for backtesting only.
+Selection uses only the first 70% of the history (in-sample training).
+Out-of-sample metrics on the last 30% are returned for logging only, not for choosing the winner.
 """
 
 import sys
@@ -18,7 +18,7 @@ import pandas as pd
 from engine.backtest_engine import BacktestEngine
 from strategies.momentum import MomentumStrategy
 from strategies.mean_reversion import MeanReversionStrategy
-
+from trading_constants import STRATEGY_SELECTOR_TRAIN_FRACTION
 
 # Minimum number of rows for a valid backtest
 MIN_LOOKBACK_ROWS = 30
@@ -44,41 +44,51 @@ def profit_probability_from_backtest(portfolio_values):
 
 def select_strategy_for_ticker(ticker, data, lookback_days=60):
     """
-    Run short backtests for Momentum and Mean Reversion on the given data,
-    compute profit probability for each, and return the winning strategy class.
-
-    Args:
-        ticker: Ticker symbol (for logging; not used in computation).
-        data: DataFrame with 'Close' and same format as executor/backtest (Date index, OHLCV).
-        lookback_days: Minimum number of days required; if data has fewer rows, returns Momentum as default.
+    Run backtests on train (first 70%) only to pick Momentum vs MA Crossover.
+    Profit probabilities on validation (last 30%) are computed for reporting only.
 
     Returns:
-        Tuple (winner_strategy_class, profit_prob_momentum, profit_prob_ma).
-        winner_strategy_class is MomentumStrategy or MeanReversionStrategy (the class, not instance).
-        On tie or error, prefers Momentum.
+        (winner_strategy_class, prob_mom_train, prob_ma_train, prob_mom_val, prob_ma_val)
     """
+    empty = (MomentumStrategy, 0.0, 0.0, 0.0, 0.0)
     if data is None or not isinstance(data, pd.DataFrame) or data.empty:
-        return MomentumStrategy, 0.0, 0.0
+        return empty
+    if lookback_days is not None and lookback_days > 0 and len(data) > lookback_days:
+        data = data.iloc[-int(lookback_days) :].copy()
     if len(data) < MIN_LOOKBACK_ROWS:
-        return MomentumStrategy, 0.0, 0.0
+        return empty
 
-    engine = BacktestEngine(initial_capital=100000, commission=0.001)
+    split_idx = int(len(data) * STRATEGY_SELECTOR_TRAIN_FRACTION)
+    if split_idx < MIN_LOOKBACK_ROWS or len(data) - split_idx < 2:
+        return empty
+
+    train = data.iloc[:split_idx]
+    val = data.iloc[split_idx:]
+
+    engine = BacktestEngine()
 
     try:
-        res_mom = engine.run(data, MomentumStrategy())
-        res_ma = engine.run(data, MeanReversionStrategy())
+        res_mom_tr = engine.run(train, MomentumStrategy())
+        res_ma_tr = engine.run(train, MeanReversionStrategy())
     except Exception:
-        return MomentumStrategy, 0.0, 0.0
+        return empty
 
-    prob_mom = profit_probability_from_backtest(res_mom.get("portfolio_values"))
-    prob_ma = profit_probability_from_backtest(res_ma.get("portfolio_values"))
+    prob_mom_tr = profit_probability_from_backtest(res_mom_tr.get("portfolio_values"))
+    prob_ma_tr = profit_probability_from_backtest(res_ma_tr.get("portfolio_values"))
 
-    # Tie-break: use total_return
-    if abs(prob_mom - prob_ma) < 1e-6:
-        ret_mom = res_mom.get("total_return", 0.0) or 0.0
-        ret_ma = res_ma.get("total_return", 0.0) or 0.0
+    if abs(prob_mom_tr - prob_ma_tr) < 1e-6:
+        ret_mom = res_mom_tr.get("total_return", 0.0) or 0.0
+        ret_ma = res_ma_tr.get("total_return", 0.0) or 0.0
         winner = MeanReversionStrategy if ret_ma > ret_mom else MomentumStrategy
     else:
-        winner = MeanReversionStrategy if prob_ma > prob_mom else MomentumStrategy
+        winner = MeanReversionStrategy if prob_ma_tr > prob_mom_tr else MomentumStrategy
 
-    return winner, prob_mom, prob_ma
+    try:
+        res_mom_val = engine.run(val, MomentumStrategy())
+        res_ma_val = engine.run(val, MeanReversionStrategy())
+        prob_mom_val = profit_probability_from_backtest(res_mom_val.get("portfolio_values"))
+        prob_ma_val = profit_probability_from_backtest(res_ma_val.get("portfolio_values"))
+    except Exception:
+        prob_mom_val, prob_ma_val = 0.0, 0.0
+
+    return winner, prob_mom_tr, prob_ma_tr, prob_mom_val, prob_ma_val

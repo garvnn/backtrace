@@ -87,16 +87,22 @@ def run_daily_strategy():
                 log.warning("Skipping %s: insufficient data", ticker)
                 continue
 
-            winner_class, prob_mom, prob_ma = select_strategy_for_ticker(
-                ticker, data, lookback_days=SELECTOR_LOOKBACK_DAYS
-            )
+            (
+                winner_class,
+                prob_mom_tr,
+                prob_ma_tr,
+                prob_mom_val,
+                prob_ma_val,
+            ) = select_strategy_for_ticker(ticker, data, lookback_days=SELECTOR_LOOKBACK_DAYS)
             winner_name = winner_class().name
             log.info(
-                "Chosen strategy for %s: %s (profit_prob Momentum=%.2f, MA=%.2f)",
+                "Chosen strategy for %s: %s (train prob M=%.2f MA=%.2f; val prob M=%.2f MA=%.2f)",
                 ticker,
                 winner_name,
-                prob_mom,
-                prob_ma,
+                prob_mom_tr,
+                prob_ma_tr,
+                prob_mom_val,
+                prob_ma_val,
             )
 
             # Run executor with winning strategy

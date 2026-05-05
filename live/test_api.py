@@ -256,6 +256,16 @@ def test_positions_detail():
     return True
 
 
+def test_divergence_analysis_no_backtest():
+    """GET /divergence-analysis returns 422 when no saved backtest for ticker/strategy."""
+    from fastapi.testclient import TestClient
+    app = get_app_with_test_db()
+    client = TestClient(app)
+    r = client.get("/divergence-analysis?ticker=AAPL&strategy=Momentum")
+    assert r.status_code == 422
+    return True
+
+
 def main():
     tests = [
         ("GET /", test_root),
@@ -274,6 +284,7 @@ def main():
         ("GET /live-benchmark", test_live_benchmark),
         ("POST /run-executor", test_run_executor_requires_ticker),
         ("GET /positions-detail", test_positions_detail),
+        ("GET /divergence-analysis", test_divergence_analysis_no_backtest),
     ]
     print("=" * 60)
     print("API ENDPOINT TESTS")

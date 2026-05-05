@@ -10,6 +10,8 @@ sys.path.insert(0, PROJECT_ROOT)
 sys.path.insert(0, LIVE_DIR)
 
 import logging
+from typing import Optional
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -367,8 +369,7 @@ def get_daily_bars(ticker: str, time_range: str = "1Y"):
     return {"ticker": sym, "bars": rows}
 
 
-# Starting capital for live paper trading; return % is always from this baseline
-INITIAL_CAPITAL = 100_000
+from trading_constants import INITIAL_CAPITAL
 
 
 def _compute_spy_benchmark(start_date: str, end_date: str, initial_capital: float):
@@ -455,6 +456,83 @@ def get_performance(strategy: str = None):
         "current_value": current_value,
         "initial_value": initial_value,
     }
+
+
+def _normalize_strategy_for_db(strategy: str) -> str:
+    """Saved backtests use MeanReversion; UI may send MA Crossover."""
+    s = (strategy or "Momentum").strip()
+    if s == "MA Crossover":
+        return "MeanReversion"
+    return s
+
+
+@app.get("/divergence-analysis")
+def get_divergence_analysis(
+    ticker: str,
+    strategy: str = "Momentum",
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    backtest_id: Optional[int] = None,
+    forward_fill_live: bool = False,
+    short_window: int = 50,
+    long_window: int = 200,
+    lookback_period: int = 120,
+    stat_lookback: int = 60,
+    entry_threshold: float = 2.0,
+    exit_threshold: float = 0.5,
+    include_robustness: bool = True,
+    n_bootstrap: int = 1000,
+):
+    """
+    Compare saved backtest to live snapshots; attribution, rolling gaps, and optional robustness (walk-forward, bootstrap CIs, etc.).
+    """
+    from analytics.divergence import build_full_report
+
+    ticker = ticker.strip().upper()
+    if not ticker:
+        raise HTTPException(status_code=400, detail="ticker is required")
+    strat_db = _normalize_strategy_for_db(strategy)
+    results = db.get_backtest_results(ticker=ticker, strategy=strat_db)
+    if not results:
+        raise HTTPException(
+            status_code=422,
+            detail=f"No backtest results for ticker={ticker} strategy={strat_db}. Run POST /backtest first.",
+        )
+    row = None
+    if backtest_id is not None:
+        for r in results:
+            if r.get("id") == backtest_id:
+                row = r
+                break
+        if row is None:
+            raise HTTPException(
+                status_code=422,
+                detail=f"backtest_id={backtest_id} not found for ticker={ticker} strategy={strat_db}",
+            )
+    else:
+        row = results[0]
+
+    history = db.get_portfolio_history(strategy=None)
+    report = build_full_report(
+        row,
+        history,
+        start_date=start_date,
+        end_date=end_date,
+        forward_fill_live=forward_fill_live,
+        short_window=short_window,
+        long_window=long_window,
+        lookback_period=lookback_period,
+        stat_lookback=stat_lookback,
+        entry_threshold=entry_threshold,
+        exit_threshold=exit_threshold,
+        include_robustness=include_robustness,
+        n_bootstrap=n_bootstrap,
+    )
+    report["ticker"] = ticker
+    report["strategy_query"] = strategy
+    report["strategy_normalized"] = strat_db
+    report["backtest_id"] = row.get("id")
+    return report
 
 
 class BacktestRequest(BaseModel):
