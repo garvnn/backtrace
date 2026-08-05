@@ -107,7 +107,11 @@ def run_daily_strategy():
 
             # Run executor with winning strategy
             strategy = winner_class()
-            executor = StrategyExecutor(strategy, ticker=ticker)
+            if isinstance(strategy, MeanReversionStrategy):
+                params = {"short_window": strategy.short_window, "long_window": strategy.long_window}
+            else:
+                params = {"lookback_period": strategy.lookback_period}
+            executor = StrategyExecutor(strategy, ticker=ticker, params=params)
             executor.run()
             log.info("Completed %s on %s", strategy.name, ticker)
         except Exception as e:
