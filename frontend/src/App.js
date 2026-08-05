@@ -45,6 +45,7 @@ function App() {
   const [monteCarloLoading, setMonteCarloLoading] = useState(false);
   const [monteCarloError, setMonteCarloError] = useState(null);
   const [tickerFilter, setTickerFilter] = useState('');
+  const [confirmDeleteId, setConfirmDeleteId] = useState(null);
   const [activeTab, setActiveTab] = useState('Dashboard');
   const [chartRange, setChartRange] = useState('All'); // '1M' | '3M' | '6M' | '1Y' | 'All'
   const [chartMode, setChartMode] = useState('equity'); // 'equity' | 'candles'
@@ -421,7 +422,36 @@ function App() {
     const p = trade.params;
     if (!p) return '—';
     if (trade.strategy === 'MeanReversion') return `Short ${p.short_window} / Long ${p.long_window}`;
+    if (trade.strategy === 'Stat Arb') return `Lookback ${p.lookback ?? '—'}, entry ${p.entry_threshold ?? '—'}, exit ${p.exit_threshold ?? '—'}`;
     return `Lookback ${p.lookback_period ?? '—'} days`;
+  };
+
+  // Alpaca order status strings arrive as raw Python enum reprs, e.g. "OrderStatus.PENDING_NEW".
+  const formatOrderStatus = (status) => {
+    if (!status) return '—';
+    const clean = String(status).replace('OrderStatus.', '').toLowerCase();
+    const labels = {
+      filled: 'Filled',
+      partially_filled: 'Partial Fill',
+      accepted: 'Accepted',
+      new: 'New',
+      pending_new: 'Pending',
+      pending_cancel: 'Pending Cancel',
+      canceled: 'Canceled',
+      cancelled: 'Canceled',
+      rejected: 'Rejected',
+      expired: 'Expired',
+    };
+    return labels[clean] || clean.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
+  };
+
+  const statusPillClass = (status) => {
+    const clean = String(status || '').replace('OrderStatus.', '').toLowerCase();
+    if (clean === 'filled') return 'status-pill status-pill-filled';
+    if (['accepted', 'new', 'partially_filled'].includes(clean)) return 'status-pill status-pill-open';
+    if (['pending_new', 'pending_cancel'].includes(clean)) return 'status-pill status-pill-pending';
+    if (['canceled', 'cancelled', 'rejected', 'expired'].includes(clean)) return 'status-pill status-pill-rejected';
+    return 'status-pill';
   };
 
   const formatExecutionSignal = (signal) => {
@@ -478,6 +508,76 @@ function App() {
     ? Math.max(0, Math.floor((Date.now() - new Date(history[0].timestamp).getTime()) / 86400000))
     : null;
   const recentTrades = trades.slice(0, 5);
+
+  // Trade statistics derived entirely from /trades: pair each SELL with the oldest
+  // open BUY for the same (strategy, ticker) — the executor always fully closes a
+  // position before reopening (see live/executor.py execute_signal), so FIFO pairing
+  // of BUY->SELL gives exact realized round-trip P&L with no backend changes needed.
+  const tradeStats = useMemo(() => {
+    const openByKey = {};
+    const closed = [];
+    let buyCount = 0;
+    let sellCount = 0;
+    const tickers = new Set();
+    const asc = [...trades].sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+    asc.forEach((t) => {
+      if (!t.ticker) return;
+      tickers.add(t.ticker);
+      const key = `${t.strategy}|${t.ticker}`;
+      if (t.side === 'BUY') {
+        buyCount += 1;
+        (openByKey[key] = openByKey[key] || []).push({ qty: Number(t.qty), price: Number(t.price), timestamp: t.timestamp });
+      } else if (t.side === 'SELL') {
+        sellCount += 1;
+        const open = openByKey[key] && openByKey[key].shift();
+        if (open && open.price != null && t.price != null) {
+          const qty = Math.min(Number(t.qty), open.qty) || Number(t.qty);
+          const pnl = qty * (Number(t.price) - open.price);
+          closed.push({
+            ticker: t.ticker,
+            strategy: t.strategy,
+            entryPrice: open.price,
+            exitPrice: Number(t.price),
+            qty,
+            pnl,
+            pnlPct: open.price ? (Number(t.price) - open.price) / open.price : null,
+            exitTime: t.timestamp,
+          });
+        }
+      }
+    });
+    const wins = closed.filter((c) => c.pnl > 0);
+    const losses = closed.filter((c) => c.pnl < 0);
+    const grossProfit = wins.reduce((s, c) => s + c.pnl, 0);
+    const grossLoss = Math.abs(losses.reduce((s, c) => s + c.pnl, 0));
+    const realizedPnl = closed.reduce((s, c) => s + c.pnl, 0);
+    return {
+      totalTrades: trades.length,
+      buyCount,
+      sellCount,
+      uniqueTickers: tickers.size,
+      closedCount: closed.length,
+      winCount: wins.length,
+      lossCount: losses.length,
+      winRate: closed.length ? wins.length / closed.length : null,
+      avgTrade: closed.length ? realizedPnl / closed.length : null,
+      profitFactor: closed.length === 0 ? null : (grossLoss > 0 ? grossProfit / grossLoss : (grossProfit > 0 ? null : 0)),
+      realizedPnl,
+      openCount: Object.values(openByKey).reduce((s, arr) => s + arr.length, 0),
+    };
+  }, [trades]);
+
+  // Connection + activity status: derived from fields the API already returns
+  // (portfolio.live_sync_used) plus the freshest timestamp across trades/logs/snapshots.
+  const lastActivityTs = useMemo(() => {
+    const candidates = [trades[0]?.timestamp, executionLogs[0]?.timestamp, portfolio?.timestamp].filter(Boolean);
+    if (!candidates.length) return null;
+    return candidates.sort((a, b) => new Date(b) - new Date(a))[0];
+  }, [trades, executionLogs, portfolio]);
+
+  const filteredTrades = tickerFilter
+    ? trades.filter((t) => (t.ticker || '').toUpperCase().includes(tickerFilter.toUpperCase()))
+    : trades;
   // Positions from GET /portfolio; merge in entry_price, current_price, pnl, pnl_pct from GET /positions-detail.
   const positionsFromPortfolio = useMemo(() => {
     const p = portfolio?.positions;
@@ -575,7 +675,7 @@ function App() {
   const tabs = [
     { id: 'Dashboard', label: 'Dashboard' },
     { id: 'Portfolio', label: 'Portfolio' },
-    { id: 'Trades', label: 'Trades' },
+    { id: 'Trades', label: 'Trading' },
     { id: 'Backtest', label: 'Backtest' },
   ];
 
@@ -738,59 +838,130 @@ function App() {
         )}
 
         {activeTab === 'Trades' && (
-          <div className="card">
-            <h2>Trade History</h2>
-            {!(strategySelect === 'Stat Arb' && pairTrades.length > 0) && trades.length > 0 && (
-              <div className="trades-filter">
-                <label htmlFor="ticker-filter-th">Filter by ticker:</label>
-                <input id="ticker-filter-th" type="text" placeholder="All tickers" value={tickerFilter} onChange={(e) => setTickerFilter(e.target.value.trim())} className="ticker-filter-input" />
+          <div className="trading-tab">
+            <div className="card">
+              <div className="system-status-bar">
+                <span className="system-status-item">
+                  <span className={`status-dot ${portfolio?.live_sync_used ? 'status-dot-live' : 'status-dot-fallback'}`} />
+                  {portfolio?.live_sync_used ? 'Connected to Alpaca (live)' : 'Fallback: last DB snapshot'}
+                </span>
+                <span className="system-status-item">
+                  <strong>Last activity</strong> {lastActivityTs ? timeAgo(lastActivityTs) : 'No activity recorded'}
+                </span>
+                <span className="system-status-item">
+                  <strong>Open tickers</strong> {tradeStats.openCount}
+                </span>
               </div>
-            )}
-            <div className="trades-table">
-              {strategySelect === 'Stat Arb' && pairTrades.length > 0 ? (
-                <table>
-                  <thead><tr><th>Time</th><th>Strategy</th><th>Pair</th><th>Side A</th><th>Side B</th><th>Qty A</th><th>Qty B</th><th>Spread</th><th>Z-score</th></tr></thead>
-                  <tbody>
-                    {pairTrades.map((pt) => (
-                      <tr key={pt.id}>
-                        <td>{new Date(pt.timestamp).toLocaleString()}</td>
-                        <td>{pt.strategy ?? '—'}</td>
-                        <td>{pt.pair_name ?? `${pt.ticker_a}-${pt.ticker_b}`}</td>
-                        <td className={pt.side_a === 'BUY' ? 'buy' : 'sell'}>{pt.side_a}</td>
-                        <td className={pt.side_b === 'BUY' ? 'buy' : 'sell'}>{pt.side_b}</td>
-                        <td>{pt.qty_a}</td>
-                        <td>{pt.qty_b}</td>
-                        <td>{pt.spread != null ? Number(pt.spread).toFixed(4) : '—'}</td>
-                        <td>{pt.z_score != null ? Number(pt.z_score).toFixed(2) : '—'}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              ) : (
-                <table>
-                  <thead><tr><th>Time</th><th>Strategy</th><th>Params</th><th>Side</th><th>Ticker</th><th>Qty</th><th>Price</th><th>Status</th><th>Actions</th></tr></thead>
-                  <tbody>
-                    {(tickerFilter ? trades.filter((t) => (t.ticker || '').toUpperCase().includes(tickerFilter.toUpperCase())) : trades).map((trade) => (
-                      <tr key={trade.id}>
-                        <td>{new Date(trade.timestamp).toLocaleString()}</td>
-                        <td>{trade.strategy ?? '—'}</td>
-                        <td>{formatTradeParams(trade)}</td>
-                        <td className={trade.side === 'BUY' ? 'buy' : 'sell'}>{trade.side}</td>
-                        <td>{trade.ticker}</td>
-                        <td>{trade.qty}</td>
-                        <td>{trade.price ? formatCurrency(trade.price) : '-'}</td>
-                        <td>{trade.status}</td>
-                        <td><button type="button" className="delete-trade-btn" onClick={() => deleteTrade(trade.id)}>Delete</button></td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
+
+              <h2>Trading Summary</h2>
+              <div className="trading-stats-grid">
+                <div className="trading-stat">
+                  <span className="label">Total Trades</span>
+                  <span className="value num-mono">{tradeStats.totalTrades}</span>
+                </div>
+                <div className="trading-stat">
+                  <span className="label">Buy / Sell</span>
+                  <span className="value num-mono"><span className="buy">{tradeStats.buyCount}</span> / <span className="sell">{tradeStats.sellCount}</span></span>
+                </div>
+                <div className="trading-stat">
+                  <span className="label">Tickers Traded</span>
+                  <span className="value num-mono">{tradeStats.uniqueTickers}</span>
+                </div>
+                <div className="trading-stat">
+                  <span className="label">Realized P&amp;L</span>
+                  <span className={`value num-mono ${tradeStats.realizedPnl >= 0 ? 'positive' : 'negative'}`}>
+                    {tradeStats.closedCount > 0 ? formatCurrency(tradeStats.realizedPnl) : '—'}
+                  </span>
+                </div>
+                <div className="trading-stat">
+                  <span className="label">Win Rate</span>
+                  <span className="value num-mono">{tradeStats.winRate != null ? `${formatPercent(tradeStats.winRate)} (${tradeStats.winCount}/${tradeStats.closedCount})` : '—'}</span>
+                </div>
+                <div className="trading-stat">
+                  <span className="label">Avg Trade</span>
+                  <span className={`value num-mono ${tradeStats.avgTrade >= 0 ? 'positive' : 'negative'}`}>
+                    {tradeStats.avgTrade != null ? formatCurrency(tradeStats.avgTrade) : '—'}
+                  </span>
+                </div>
+                <div className="trading-stat">
+                  <span className="label">Profit Factor</span>
+                  <span className="value num-mono">{tradeStats.profitFactor != null ? tradeStats.profitFactor.toFixed(2) : (tradeStats.closedCount > 0 ? '∞' : '—')}</span>
+                </div>
+              </div>
+              {tradeStats.closedCount === 0 && tradeStats.totalTrades > 0 && (
+                <p className="empty-placeholder" style={{ padding: '0.5rem 0 0', textAlign: 'left' }}>
+                  No closed round-trips yet — P&amp;L, win rate, and profit factor need a matching SELL after a BUY. Currently {tradeStats.totalTrades} open/one-sided trade(s).
+                </p>
               )}
             </div>
-            {loading && trades.length === 0 && pairTrades.length === 0 && <div className="loading-placeholder">Loading…</div>}
-            {!loading && trades.length === 0 && pairTrades.length === 0 && <p className="empty-placeholder">No trades yet — run your first backtest.</p>}
 
-            <div className="decision-logs-section">
+            <div className="card">
+              <h2>Trade History</h2>
+              {!(strategySelect === 'Stat Arb' && pairTrades.length > 0) && trades.length > 0 && (
+                <div className="trades-filter">
+                  <label htmlFor="ticker-filter-th">Filter by ticker:</label>
+                  <input id="ticker-filter-th" type="text" placeholder="All tickers" value={tickerFilter} onChange={(e) => setTickerFilter(e.target.value)} className="ticker-filter-input" />
+                  {tickerFilter && <span className="filter-count">Showing {filteredTrades.length} of {trades.length}</span>}
+                </div>
+              )}
+              <div className="trades-table">
+                {strategySelect === 'Stat Arb' && pairTrades.length > 0 ? (
+                  <table>
+                    <thead><tr><th>Time</th><th>Strategy</th><th>Pair</th><th>Side A</th><th>Side B</th><th>Qty A</th><th>Qty B</th><th>Spread</th><th>Z-score</th></tr></thead>
+                    <tbody>
+                      {pairTrades.map((pt) => (
+                        <tr key={pt.id}>
+                          <td>{new Date(pt.timestamp).toLocaleString()}</td>
+                          <td>{pt.strategy ?? '—'}</td>
+                          <td>{pt.pair_name ?? `${pt.ticker_a}-${pt.ticker_b}`}</td>
+                          <td className={pt.side_a === 'BUY' ? 'buy' : 'sell'}>{pt.side_a}</td>
+                          <td className={pt.side_b === 'BUY' ? 'buy' : 'sell'}>{pt.side_b}</td>
+                          <td>{pt.qty_a}</td>
+                          <td>{pt.qty_b}</td>
+                          <td>{pt.spread != null ? Number(pt.spread).toFixed(4) : '—'}</td>
+                          <td>{pt.z_score != null ? Number(pt.z_score).toFixed(2) : '—'}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                ) : (
+                  <table>
+                    <thead><tr><th>Time</th><th>Strategy</th><th>Params</th><th>Side</th><th>Ticker</th><th>Qty</th><th>Price</th><th>Status</th><th>Actions</th></tr></thead>
+                    <tbody>
+                      {filteredTrades.map((trade) => (
+                        <tr key={trade.id}>
+                          <td>{new Date(trade.timestamp).toLocaleString()}</td>
+                          <td>{trade.strategy ?? '—'}</td>
+                          <td>{formatTradeParams(trade)}</td>
+                          <td className={trade.side === 'BUY' ? 'buy' : 'sell'}>{trade.side}</td>
+                          <td>{trade.ticker}</td>
+                          <td>{trade.qty}</td>
+                          <td>{trade.price ? formatCurrency(trade.price) : '-'}</td>
+                          <td><span className={statusPillClass(trade.status)}>{formatOrderStatus(trade.status)}</span></td>
+                          <td>
+                            {confirmDeleteId === trade.id ? (
+                              <span className="delete-confirm-group">
+                                <button type="button" className="delete-trade-btn delete-trade-btn-confirm" onClick={() => { deleteTrade(trade.id); setConfirmDeleteId(null); }}>Confirm</button>
+                                <button type="button" className="delete-trade-btn-cancel" onClick={() => setConfirmDeleteId(null)}>Cancel</button>
+                              </span>
+                            ) : (
+                              <button type="button" className="delete-trade-btn" onClick={() => setConfirmDeleteId(trade.id)}>Delete</button>
+                            )}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                )}
+              </div>
+              {loading && trades.length === 0 && pairTrades.length === 0 && <div className="loading-placeholder">Loading…</div>}
+              {!loading && trades.length === 0 && pairTrades.length === 0 && <p className="empty-placeholder">No trades yet — run your first backtest.</p>}
+              {!loading && trades.length > 0 && tickerFilter && filteredTrades.length === 0 && (
+                <p className="empty-placeholder">No trades match ticker &quot;{tickerFilter}&quot;.</p>
+              )}
+            </div>
+
+            <div className="card">
               <h2>Decision Logs</h2>
               <p className="decision-logs-note">Shows why the executor placed a trade or skipped one.</p>
               <div className="trades-table">
@@ -843,7 +1014,11 @@ function App() {
                   </tbody>
                 </table>
               </div>
-              {!loading && executionLogs.length === 0 && <p className="empty-placeholder">No decision logs yet — run the executor once.</p>}
+              {!loading && executionLogs.length === 0 && (
+                <div className="empty-state">
+                  <p>No decision logs yet. The executor writes a reason for every run — trade or skip — via <code className="num-mono">POST /run-executor</code> or <code className="num-mono">python live/executor.py</code>.</p>
+                </div>
+              )}
             </div>
           </div>
         )}
