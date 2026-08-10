@@ -1409,6 +1409,11 @@ tbody tr:hover {
   box-shadow: 0 0 0 3px rgba(184, 149, 74, 0.18);
 }
 
+.system-status-value-margin {
+  color: var(--accent);
+  font-weight: 600;
+}
+
 .trading-stats-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
