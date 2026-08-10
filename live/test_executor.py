@@ -231,6 +231,63 @@ def test_error_handling_bad_ticker():
     return False
 
 
+def test_session_budget_caps_cumulative_spend_across_tickers():
+    """
+    Two tickers, each individually within MAX_DOLLAR_PER_STOCK and buying_power,
+    but sharing a SessionBudget smaller than their combined per-stock caps.
+    Without the shared budget, each would buy up to MAX_DOLLAR_PER_STOCK
+    independently (over-spending real cash via margin); with it, the second
+    ticker's buy must be sized down to whatever's left.
+    """
+    import pandas as pd
+    from executor import StrategyExecutor, SessionBudget
+    from strategies.momentum import MomentumStrategy
+    from database import Database
+    from trading_constants import MAX_DOLLAR_PER_STOCK
+
+    data = pd.DataFrame(
+        {"Open": [100] * 5, "High": [101] * 5, "Low": [99] * 5, "Close": [100.0] * 5, "Volume": [1e6] * 5},
+        index=pd.date_range("2024-01-01", periods=5, freq="D"),
+    )
+
+    # Session budget smaller than 2x MAX_DOLLAR_PER_STOCK: the two tickers'
+    # per-stock caps ($10k each = $20k) would together exceed it ($15k).
+    budget = SessionBudget(15000.0)
+    assert budget.remaining == 15000.0
+
+    fd, db_path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    try:
+        # High buying_power (as on a margin account, matching the real account
+        # this was diagnosed on) so the OLD per-stock-only cap would let both
+        # tickers buy the full MAX_DOLLAR_PER_STOCK ($10k) each = $20k total.
+        mock_client = _mock_trading_client()
+        with patch.dict(os.environ, {"ALPACA_API_KEY": "x", "ALPACA_SECRET_KEY": "y"}, clear=False):
+            with patch("executor.TradingClient", return_value=mock_client):
+                db = Database(db_path)
+                db.get_last_executed_signal = MagicMock(return_value=None)
+                with patch("executor.Database", return_value=db):
+                    ex_a = StrategyExecutor(MomentumStrategy(), ticker="AAA", session_budget=budget)
+                    ex_b = StrategyExecutor(MomentumStrategy(), ticker="BBB", session_budget=budget)
+
+            ex_a.execute_signal(1, data)
+            assert budget.remaining == 5000.0, f"expected $5,000 left after first buy, got {budget.remaining}"
+
+            ex_b.execute_signal(1, data)
+            assert budget.remaining == 0.0, f"expected $0 left after second buy, got {budget.remaining}"
+
+        calls = mock_client.submit_order.call_args_list
+        assert len(calls) == 2, f"expected 2 orders submitted, got {len(calls)}"
+        qty_a = calls[0].args[0].qty
+        qty_b = calls[1].args[0].qty
+        assert qty_a == 100, f"first buy should be full $10k/$100 = 100 shares, got {qty_a}"
+        assert qty_b == 50, f"second buy should be capped to remaining $5k/$100 = 50 shares (not another {int(MAX_DOLLAR_PER_STOCK/100)}), got {qty_b}"
+        return True
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+
 def main():
     print("=" * 60)
     print("EXECUTOR FULL TEST (Mocked Orders)")
@@ -252,6 +309,13 @@ def main():
         print(f"  Bad ticker handled: {bad_ok}")
     except Exception as e:
         print(f"  Bad ticker test error: {e}")
+    print()
+    print("Session budget caps cumulative spend across tickers...")
+    try:
+        budget_ok = test_session_budget_caps_cumulative_spend_across_tickers()
+        print(f"  Session budget capping correct: {budget_ok}")
+    except Exception as e:
+        print(f"  Session budget test error: {e}")
     print("=" * 60)
     passed = sum(1 for r in results if not r["error"] and r["data_ok"] and r["signal_ok"])
     print(f"Summary: {passed}/{len(results)} tickers passed (mock mode)")

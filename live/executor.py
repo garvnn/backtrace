@@ -48,11 +48,39 @@ def _bars_to_backtrace_df(df_one):
     return df
 
 
+class SessionBudget:
+    """
+    Tracks cumulative dollars available for new BUYs across a batch of tickers
+    processed in a single scheduler run (see scheduler.py run_daily_strategy).
+
+    Without this, each ticker's buy is capped only against MAX_DOLLAR_PER_STOCK
+    and the account's buying_power — and buying_power on a margin account can
+    be several times actual cash. A batch of independently-capped buys can
+    then collectively deploy more real cash than the account holds, drawing
+    on margin with no one buy ever looking oversized. This ties all buys in
+    one run to a single shared, cash-based ceiling.
+
+    Only wired into the single-ticker path (execute_signal); pair execution
+    (Stat Arb) is not run in a batch loop today, so it doesn't need this.
+    """
+
+    def __init__(self, total):
+        self.remaining = max(0.0, float(total))
+
+    def reserve(self, amount):
+        """Deduct up to `amount` from the remaining budget. Returns the amount actually deducted."""
+        amount = max(0.0, float(amount))
+        granted = min(amount, self.remaining)
+        self.remaining -= granted
+        return granted
+
+
 class StrategyExecutor:
-    def __init__(self, strategy, ticker='AAPL', params=None):
+    def __init__(self, strategy, ticker='AAPL', params=None, session_budget=None):
         self.strategy = strategy
         self.ticker = ticker
         self.params = params  # optional dict e.g. short_window, long_window, lookback_period for logging
+        self.session_budget = session_budget  # optional SessionBudget shared across a batch run
         api_key = os.getenv('ALPACA_API_KEY')
         secret_key = os.getenv('ALPACA_SECRET_KEY')
         if not api_key or not secret_key:
@@ -173,10 +201,15 @@ class StrategyExecutor:
         
         # Signal = 1 (buy), 0 (sell/flat). Only place order when signal changed from last executed.
         if signal == 1 and current_position == 0 and last_signal != 1:
-            # Buy: cap at MAX_DOLLAR_PER_STOCK per stock
+            # Buy: cap at MAX_DOLLAR_PER_STOCK per stock, and at whatever's left of the
+            # shared session budget (if any) so a multi-ticker batch can't collectively
+            # spend more real cash than the account holds — see SessionBudget.
             dollar_amount = min(MAX_DOLLAR_PER_STOCK, buying_power * BUYING_POWER_FRACTION)
+            session_budget_remaining = self.session_budget.remaining if self.session_budget is not None else None
+            if session_budget_remaining is not None:
+                dollar_amount = min(dollar_amount, session_budget_remaining)
             qty = int(dollar_amount / current_price)
-            
+
             if qty > 0:
                 order_data = MarketOrderRequest(
                     symbol=self.ticker,
@@ -186,7 +219,9 @@ class StrategyExecutor:
                 )
                 order = self.trading_client.submit_order(order_data)
                 print(f"BUY order placed: {qty} shares")
-                
+                if self.session_budget is not None:
+                    self.session_budget.reserve(qty * current_price)
+
                 # Log to database
                 self.db.log_trade(
                     strategy=self.strategy.name,
@@ -210,10 +245,11 @@ class StrategyExecutor:
                         "price": current_price,
                         "qty": qty,
                         "max_dollar_per_stock": MAX_DOLLAR_PER_STOCK,
+                        "session_budget_remaining_before": session_budget_remaining,
                         "params": self.params,
                     },
                 )
-                
+
                 return order
             self._log_execution_event(
                 ticker=self.ticker,
@@ -227,6 +263,7 @@ class StrategyExecutor:
                     "price": current_price,
                     "computed_qty": qty,
                     "max_dollar_per_stock": MAX_DOLLAR_PER_STOCK,
+                    "session_budget_remaining": session_budget_remaining,
                     "params": self.params,
                 },
             )
