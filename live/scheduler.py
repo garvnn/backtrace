@@ -72,11 +72,18 @@ def run_daily_strategy():
     """Run one strategy per ticker (Momentum or MA Crossover) chosen by profit probability. Stat Arb is not run live."""
     from strategies.momentum import MomentumStrategy
     from strategies.mean_reversion import MeanReversionStrategy
-    from executor import StrategyExecutor
+    from executor import StrategyExecutor, SessionBudget
     from strategy_selector import select_strategy_for_ticker
+    from trading_constants import BUYING_POWER_FRACTION
 
     log = _get_logger()
     log.info("Daily BackTrace job started")
+
+    # Shared across every ticker in this run: caps total new-BUY dollars at
+    # actual account cash, not the (possibly margin-leveraged) buying_power
+    # each ticker would otherwise see independently. Seeded lazily from the
+    # first ticker that gets far enough to have a live trading_client.
+    session_budget = None
 
     for ticker in TOP_10_SPY:
         try:
@@ -105,9 +112,21 @@ def run_daily_strategy():
                 prob_ma_val,
             )
 
+            if session_budget is None:
+                try:
+                    cash = float(executor.trading_client.get_account().cash)
+                    session_budget = SessionBudget(cash * BUYING_POWER_FRACTION)
+                    log.info("Session capital budget for this run: $%.2f (from account cash $%.2f)", session_budget.remaining, cash)
+                except Exception as budget_err:
+                    log.warning("Could not determine account cash for session budget cap; proceeding without a batch-level cap: %s", budget_err)
+
             # Run executor with winning strategy
             strategy = winner_class()
-            executor = StrategyExecutor(strategy, ticker=ticker)
+            if isinstance(strategy, MeanReversionStrategy):
+                params = {"short_window": strategy.short_window, "long_window": strategy.long_window}
+            else:
+                params = {"lookback_period": strategy.lookback_period}
+            executor = StrategyExecutor(strategy, ticker=ticker, params=params, session_budget=session_budget)
             executor.run()
             log.info("Completed %s on %s", strategy.name, ticker)
         except Exception as e:

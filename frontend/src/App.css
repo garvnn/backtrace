@@ -1362,10 +1362,143 @@ tbody tr:hover {
   font-size: 0.9rem;
 }
 
-.decision-logs-section {
-  margin-top: 1.5rem;
-  padding-top: 1rem;
-  border-top: 1px solid var(--border);
+.trading-tab {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.system-status-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+  align-items: center;
+  margin-bottom: var(--space-3);
+  padding-bottom: var(--space-2);
+  border-bottom: 1px solid var(--border);
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+}
+
+.system-status-item {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.system-status-item strong {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+  flex-shrink: 0;
+}
+
+.status-dot-live {
+  background: var(--positive);
+  box-shadow: 0 0 0 3px rgba(107, 143, 114, 0.18);
+}
+
+.status-dot-fallback {
+  background: var(--accent);
+  box-shadow: 0 0 0 3px rgba(184, 149, 74, 0.18);
+}
+
+.trading-stats-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 0.75rem;
+}
+
+.trading-stat {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  background: var(--bg);
+  border-radius: 8px;
+  padding: 0.85rem 1rem;
+}
+
+.trading-stat .label {
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.trading-stat .value {
+  font-size: 1.1rem;
+  font-weight: 600;
+}
+
+.status-pill {
+  display: inline-block;
+  padding: 2px 9px;
+  border-radius: 999px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  border: 1px solid var(--border-strong);
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.status-pill-filled {
+  color: var(--positive);
+  border-color: rgba(107, 143, 114, 0.4);
+  background: rgba(107, 143, 114, 0.1);
+}
+
+.status-pill-open {
+  color: var(--accent);
+  border-color: rgba(184, 149, 74, 0.4);
+  background: rgba(184, 149, 74, 0.1);
+}
+
+.status-pill-pending {
+  color: var(--text-secondary);
+  border-color: var(--border-strong);
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.status-pill-rejected {
+  color: var(--negative);
+  border-color: rgba(166, 123, 123, 0.4);
+  background: rgba(166, 123, 123, 0.1);
+}
+
+.delete-confirm-group {
+  display: inline-flex;
+  gap: 0.4rem;
+  align-items: center;
+}
+
+.delete-trade-btn-confirm {
+  border-color: var(--negative) !important;
+  background: rgba(166, 123, 123, 0.18) !important;
+}
+
+.delete-trade-btn-cancel {
+  padding: 0.25rem 0.5rem;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+
+.delete-trade-btn-cancel:hover {
+  border-color: var(--border-strong);
+  color: var(--text-primary);
+}
+
+.filter-count {
+  color: var(--text-secondary);
+  font-size: 0.8rem;
 }
 
 .decision-logs-note {
