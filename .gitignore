@@ -1,4 +1,11 @@
-cat > .gitignore << 'EOF'
+# Secrets
+.env
+live/.env
+
+# Local state
+*.db
+*.log
+
 # Virtual environment
 venv/
 env/
@@ -8,7 +15,7 @@ __pycache__/
 *.py[cod]
 *$py.class
 
-# Data files
+# Cached market data
 data/cache/
 *.csv
 
@@ -22,8 +29,3 @@ results/
 
 # OS
 .DS_Store
-EOF
-
-.env
-live/.env
-*.db

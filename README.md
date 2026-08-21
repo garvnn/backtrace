@@ -23,17 +23,37 @@ BackTrace runs the same strategies in two modes: **backtesting** on historical d
 
 ## Results
 
-*(To be updated with actual data.)*
+**Not yet measured.** The live paper-trading period is still accumulating, and the execution
+layer does not yet record actual fill prices (see [Known gaps](#known-gaps)) — so any
+backtest-vs-live number reported today would not be attributable to real fills.
 
-After [X] weeks of live trading ([Y] trades):
+The intended result is a single attributed divergence figure, in this form:
 
-| Strategy       | Backtest | Live    | Difference |
-|----------------|----------|---------|------------|
-| Momentum       | +X.XX%   | +Y.YY%  | ±Z.ZZ%     |
-| MA Crossover   | +X.XX%   | +Y.YY%  | ±Z.ZZ%     |
-| Stat Arb       | +X.XX%   | +Y.YY%  | ±Z.ZZ%     |
+```
+Over N trading days, M paper trades, 10-name universe:
+Momentum (120d) returned +A.A% live vs +B.B% backtested — a gap of −C.C% ± D.D%
 
-**Analysis:** *(Objective explanation of observed differences once data is available.)*
+Attribution:
+  −x.x%   execution timing (T+1 open fills vs. same-bar close)
+  −x.x%   transaction cost
+  −x.x%   data vendor (Alpaca IEX vs. Yahoo consolidated closes)
+  −x.x%   unexplained
+```
+
+The attribution machinery exists (`analytics/divergence.py`) and the confidence interval comes
+from the block bootstrap in `analytics/robustness.py`. What is missing is trustworthy fill data
+to feed them.
+
+## Known gaps
+
+Tracked honestly rather than described as working:
+
+- Orders are submitted but never polled, so recorded trade prices are the prior close rather
+  than the fill price, and order status is frozen at `PENDING_NEW`. Partial fills are invisible.
+- Market data uses Alpaca's default feed (IEX on the free plan), not consolidated tape.
+- No market-hours or holiday gating (`get_clock`/`get_calendar` are not called).
+- No retry or rate-limit handling on Alpaca calls.
+- The API is unauthenticated; `POST /run-executor` places real orders.
 
 ## What This Demonstrates
 
