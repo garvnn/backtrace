@@ -85,6 +85,9 @@ def run_daily_strategy():
     # first ticker that gets far enough to have a live trading_client.
     session_budget = None
 
+    # Kept so the run can take exactly one account-level snapshot at the end.
+    last_executor = None
+
     for ticker in TOP_10_SPY:
         try:
             # Get data via executor (same source as live signals)
@@ -128,6 +131,7 @@ def run_daily_strategy():
                 params = {"lookback_period": strategy.lookback_period}
             executor = StrategyExecutor(strategy, ticker=ticker, params=params, session_budget=session_budget)
             executor.run()
+            last_executor = executor
             log.info("Completed %s on %s", strategy.name, ticker)
         except Exception as e:
             log.error(
@@ -136,6 +140,19 @@ def run_daily_strategy():
                 e,
                 traceback.format_exc(),
             )
+
+    # One snapshot for the whole run, after every ticker has been processed.
+    # A snapshot is account-level state, so taking it inside executor.run() wrote
+    # one row per ticker - ten near-identical rows per trading day, which made
+    # the equity curve's "daily" returns actually intra-run returns.
+    if last_executor is not None:
+        try:
+            last_executor.log_portfolio_snapshot()
+            log.info("Recorded end-of-run portfolio snapshot")
+        except Exception as snap_err:
+            log.error("Failed to record end-of-run snapshot: %s", snap_err)
+    else:
+        log.warning("No ticker completed; no snapshot recorded")
 
     log.info("Daily BackTrace job finished")
 
@@ -151,6 +168,7 @@ def run_test_job():
         strategy = MomentumStrategy()
         executor = StrategyExecutor(strategy, ticker="AAPL")
         executor.run()
+        executor.log_portfolio_snapshot()
         log.info("Test job completed successfully")
     except Exception as e:
         log.error("Test job failed: %s\n%s", e, traceback.format_exc())

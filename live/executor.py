@@ -36,6 +36,17 @@ _env_path = os.path.join(LIVE_DIR, ".env")
 load_dotenv(_env_path)
 DB_PATH = os.getenv("DB_PATH") or os.path.join(LIVE_DIR, "trading.db")
 
+def _order_status(order):
+    """
+    Alpaca order status as its wire value, e.g. "accepted".
+
+    str(order.status) yields the Python enum repr "OrderStatus.ACCEPTED", which
+    previously leaked all the way into the database and then into the browser,
+    where the frontend stripped the "OrderStatus." prefix back off.
+    """
+    return getattr(order.status, "value", str(order.status))
+
+
 def _bars_to_backtrace_df(df_one):
     """Convert Alpaca bars DataFrame (single symbol) to BackTrace format: Date index, Open/High/Low/Close/Volume."""
     df = df_one.reset_index()
@@ -230,7 +241,7 @@ class StrategyExecutor:
                     qty=qty,
                     price=current_price,
                     order_id=str(order.id),
-                    status=str(order.status),
+                    status=_order_status(order),
                     params=self.params,
                 )
                 self._log_execution_event(
@@ -278,15 +289,19 @@ class StrategyExecutor:
             )
             order = self.trading_client.submit_order(order_data)
             print(f"SELL order placed: {current_position} shares")
-            
-            # Log to database
+
+            # Log to database. price is the decision-time close, not the fill:
+            # a DAY market order placed after the close fills at the next open.
+            # Without it, exits had no price at all and no round trip in the
+            # trade log was computable.
             self.db.log_trade(
                 strategy=self.strategy.name,
                 ticker=self.ticker,
                 side='SELL',
                 qty=current_position,
+                price=current_price,
                 order_id=str(order.id),
-                status=str(order.status),
+                status=_order_status(order),
                 params=self.params,
             )
             self._log_execution_event(
@@ -498,14 +513,17 @@ class StrategyExecutor:
         )
         return None
     
-    def run(self):
-        """Run strategy and execute trades."""
-        print("="*60)
-        if self._is_stat_arb():
-            self._run_pair()
-        else:
-            self._run_single()
-        print("="*60)
+    def log_portfolio_snapshot(self):
+        """
+        Record one account-level snapshot (portfolio value, cash, all positions).
+
+        Deliberately NOT called from run(). A snapshot describes the whole
+        account, not one ticker, so calling it per-ticker in a batch wrote ten
+        near-identical rows per trading day — inflating the table tenfold and
+        making "daily" returns actually intra-run returns. Callers own the
+        cadence: the scheduler snapshots once after its ticker loop, and the
+        single-run API endpoint snapshots once after its one run.
+        """
         account = self.trading_client.get_account()
         positions = {pos.symbol: float(pos.qty) for pos in self.trading_client.get_all_positions()}
         self.db.log_portfolio_snapshot(
@@ -514,6 +532,15 @@ class StrategyExecutor:
             cash=float(account.cash),
             positions=positions
         )
+
+    def run(self):
+        """Run strategy and execute trades. Does not snapshot; see log_portfolio_snapshot."""
+        print("="*60)
+        if self._is_stat_arb():
+            self._run_pair()
+        else:
+            self._run_single()
+        print("="*60)
 
     def _run_single(self):
         """Single-ticker flow (Momentum / MA Crossover)."""
@@ -570,3 +597,4 @@ if __name__ == "__main__":
     strategy = MomentumStrategy()
     executor = StrategyExecutor(strategy, ticker='AAPL')
     executor.run()
+    executor.log_portfolio_snapshot()

@@ -442,19 +442,48 @@ def _spy_payload_for_live_window(start_date: str, end_inclusive: str):
 
 @app.get("/performance")
 def get_performance(strategy: str = None):
-    """Get performance metrics. Total return is always from original 100k capital."""
-    history = db.get_portfolio_history(strategy=strategy)
-    initial_value = INITIAL_CAPITAL
-    current_value = history[-1][3] if history else initial_value
-    total_return = (current_value - initial_value) / initial_value
+    """
+    Performance over the recorded window.
 
+    total_return is measured from the FIRST recorded snapshot, not from the
+    configured INITIAL_CAPITAL. Those differ: snapshotting began after trading
+    had already started, so the first recorded value was ~103.6k rather than
+    100k, and measuring against the constant silently credited the strategy with
+    gains from before the record exists.
+
+    configured_initial_capital and return_vs_configured_capital keep the old
+    number available, clearly labelled as what it is.
+    """
+    history = db.get_portfolio_history(strategy=strategy)
     trades = db.get_all_trades(strategy=strategy)
 
+    if not history:
+        return {
+            "total_return": 0.0,
+            "num_trades": len(trades),
+            "current_value": INITIAL_CAPITAL,
+            "initial_value": INITIAL_CAPITAL,
+            "configured_initial_capital": INITIAL_CAPITAL,
+            "return_vs_configured_capital": 0.0,
+            "first_snapshot": None,
+            "last_snapshot": None,
+            "snapshot_days": 0,
+        }
+
+    first_value = float(history[0][3])
+    current_value = float(history[-1][3])
+    baseline = first_value if first_value > 0 else INITIAL_CAPITAL
+
     return {
-        "total_return": total_return,
+        "total_return": (current_value - baseline) / baseline,
         "num_trades": len(trades),
         "current_value": current_value,
-        "initial_value": initial_value,
+        "initial_value": first_value,
+        "configured_initial_capital": INITIAL_CAPITAL,
+        "return_vs_configured_capital": (current_value - INITIAL_CAPITAL) / INITIAL_CAPITAL,
+        "first_snapshot": history[0][1],
+        "last_snapshot": history[-1][1],
+        "snapshot_days": len({(row[1] or "")[:10] for row in history if row[1]}),
     }
 
 
@@ -853,6 +882,9 @@ def run_executor(req: RunExecutorRequest = None):
             params = {"lookback": req.lookback, "entry_threshold": req.entry_threshold, "exit_threshold": req.exit_threshold}
         executor = StrategyExecutor(strategy, ticker=ticker_a, params=params)
         executor.run()
+        # run() no longer snapshots; a single manual run is its own "run", so it
+        # takes exactly one snapshot here (see StrategyExecutor.log_portfolio_snapshot).
+        executor.log_portfolio_snapshot()
         out = {
             "ok": True,
             "message": "Strategy run complete. Check portfolio and trades.",
