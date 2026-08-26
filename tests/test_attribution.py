@@ -7,10 +7,9 @@ import sys
 
 import pandas as pd
 
-LIVE_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.dirname(LIVE_DIR)
-sys.path.insert(0, PROJECT_ROOT)
-sys.path.insert(0, LIVE_DIR)
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
 from analytics.divergence import (
     align_and_rebase,
