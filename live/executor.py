@@ -36,6 +36,16 @@ _env_path = os.path.join(LIVE_DIR, ".env")
 load_dotenv(_env_path)
 DB_PATH = os.getenv("DB_PATH") or os.path.join(LIVE_DIR, "trading.db")
 
+def _to_float(value):
+    """Float or None. Alpaca returns these as strings, and as None before a fill."""
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _order_status(order):
     """
     Alpaca order status as its wire value, e.g. "accepted".
@@ -170,16 +180,23 @@ class StrategyExecutor:
         return df_a.loc[common].sort_index(), df_b.loc[common].sort_index()
 
     def get_current_position(self, symbol=None):
-        """Check position for a symbol (default self.ticker). Returns signed qty."""
+        """
+        Signed quantity held for a symbol (default self.ticker). 0 means flat.
+
+        Fails closed: if Alpaca cannot be reached, this raises rather than
+        returning 0. It previously swallowed every exception and reported "flat",
+        which meant a 429, an expired key, or a transient 5xx looked identical to
+        holding nothing - and execute_signal treats "flat" as permission to buy.
+        A single failed position read could therefore open a second position on
+        top of an existing one. Callers (the scheduler's per-ticker try/except)
+        skip the ticker instead, which is the safe outcome.
+        """
         sym = symbol if symbol is not None else self.ticker
-        try:
-            positions = self.trading_client.get_all_positions()
-            for pos in positions:
-                if pos.symbol == sym:
-                    return float(pos.qty)
-            return 0
-        except Exception:
-            return 0
+        positions = self.trading_client.get_all_positions()
+        for pos in positions:
+            if pos.symbol == sym:
+                return float(pos.qty)
+        return 0
 
     def _serialize_signal(self, signal):
         """Normalize signal value to stable string."""
@@ -222,11 +239,13 @@ class StrategyExecutor:
             qty = int(dollar_amount / current_price)
 
             if qty > 0:
+                fill_model = self._fill_model()
                 order_data = MarketOrderRequest(
                     symbol=self.ticker,
                     qty=qty,
                     side=OrderSide.BUY,
-                    time_in_force=TimeInForce.DAY
+                    time_in_force=TimeInForce.DAY,
+                    client_order_id=self._client_order_id('BUY'),
                 )
                 order = self.trading_client.submit_order(order_data)
                 print(f"BUY order placed: {qty} shares")
@@ -243,6 +262,8 @@ class StrategyExecutor:
                     order_id=str(order.id),
                     status=_order_status(order),
                     params=self.params,
+                    client_order_id=getattr(order, 'client_order_id', None),
+                    fill_model=fill_model,
                 )
                 self._log_execution_event(
                     ticker=self.ticker,
@@ -281,11 +302,13 @@ class StrategyExecutor:
         
         elif signal == 0 and current_position > 0 and last_signal != 0:
             # Sell all
+            fill_model = self._fill_model()
             order_data = MarketOrderRequest(
                 symbol=self.ticker,
                 qty=current_position,
                 side=OrderSide.SELL,
-                time_in_force=TimeInForce.DAY
+                time_in_force=TimeInForce.DAY,
+                client_order_id=self._client_order_id('SELL'),
             )
             order = self.trading_client.submit_order(order_data)
             print(f"SELL order placed: {current_position} shares")
@@ -303,6 +326,8 @@ class StrategyExecutor:
                 order_id=str(order.id),
                 status=_order_status(order),
                 params=self.params,
+                client_order_id=getattr(order, 'client_order_id', None),
+                fill_model=fill_model,
             )
             self._log_execution_event(
                 ticker=self.ticker,
@@ -513,6 +538,106 @@ class StrategyExecutor:
         )
         return None
     
+    def _fill_model(self):
+        """
+        Which fill model this order will follow: the market's state decides it.
+
+        The backtest fills at Open[T+1] from a Close[T] signal. The 16:30 ET
+        scheduler matches that, because a DAY market order submitted after the
+        close queues to the next open. A manual run during market hours does
+        not: it signals off an incomplete daily bar and fills in the same
+        session, which the backtest cannot reproduce under any of its models.
+
+        Recording which case applied is what lets
+        analytics.divergence.estimate_execution_timing_impact be applied to the
+        right subset of trades instead of to all of them indiscriminately.
+        Returns None if the clock cannot be read - unknown, not assumed.
+        """
+        try:
+            return "immediate_intraday" if self.trading_client.get_clock().is_open else "queued_next_open"
+        except Exception as e:
+            print(f"Could not read market clock; fill_model unknown: {e}")
+            return None
+
+    def _client_order_id(self, side):
+        """
+        Deterministic per (strategy, ticker, date, side) so the broker rejects a
+        duplicate submission.
+
+        The existing get_last_executed_signal check is self-enforced and fails
+        open: if the DB write succeeded but the process died, or two runs overlap,
+        nothing stops a second identical order. Alpaca rejecting a repeated
+        client_order_id is enforced on the broker's side, which is the only place
+        it can be enforced reliably.
+        """
+        stamp = datetime.now().strftime("%Y%m%d")
+        slug = self.strategy.name.replace(" ", "-")
+        return f"{slug}-{self.ticker}-{stamp}-{side}"
+
+    def reconcile_open_orders(self, max_age_days=10):
+        """
+        Settle previously submitted orders against what Alpaca actually did.
+
+        Called at the START of a run, not after submitting: a DAY market order
+        placed at 16:30 does not fill until the next open ~17 hours later, so
+        there is nothing to poll at submit time. Each run therefore settles the
+        previous run's orders. This is what turns the trade log from a record of
+        intentions into a record of fills, and it is the prerequisite for any
+        per-trade slippage or P&L number.
+
+        Returns a list of the changes applied.
+        """
+        open_orders = self.db.get_unreconciled_orders(max_age_days=max_age_days)
+        if not open_orders:
+            return []
+
+        changes = []
+        for row in open_orders:
+            try:
+                order = self.trading_client.get_order_by_id(row["order_id"])
+            except Exception as e:
+                print(f"Could not fetch order {row['order_id']} for {row['ticker']}: {e}")
+                continue
+
+            status = _order_status(order)
+            filled_qty = _to_float(getattr(order, "filled_qty", None))
+            filled_avg_price = _to_float(getattr(order, "filled_avg_price", None))
+            self.db.update_trade_fill(
+                row["id"], status=status, filled_qty=filled_qty, filled_avg_price=filled_avg_price
+            )
+
+            slippage = None
+            if filled_avg_price is not None and row.get("price"):
+                # Signed against the direction of the trade: positive means the
+                # fill was worse than the price the decision was made at.
+                ref = float(row["price"])
+                slippage = filled_avg_price - ref if row["side"] == "BUY" else ref - filled_avg_price
+
+            change = {
+                "trade_id": row["id"], "ticker": row["ticker"], "side": row["side"],
+                "status": status, "filled_qty": filled_qty,
+                "filled_avg_price": filled_avg_price, "reference_price": row.get("price"),
+                "slippage": slippage,
+            }
+            changes.append(change)
+            print(
+                f"Reconciled {row['ticker']} {row['side']} order {row['order_id']}: "
+                f"{status}, filled {filled_qty} @ {filled_avg_price}"
+                + (f" (slippage {slippage:+.4f})" if slippage is not None else "")
+            )
+
+            # A non-terminal order older than a couple of trading days is not
+            # patiently waiting; something is wrong and it should be visible.
+            if status.lower() not in self.db.TERMINAL_ORDER_STATUSES:
+                age_days = (datetime.now() - datetime.fromisoformat(row["timestamp"])).days
+                if age_days >= 2:
+                    print(
+                        f"WARNING: order {row['order_id']} ({row['ticker']} {row['side']}) "
+                        f"still '{status}' after {age_days} days"
+                    )
+
+        return changes
+
     def log_portfolio_snapshot(self):
         """
         Record one account-level snapshot (portfolio value, cash, all positions).
