@@ -58,3 +58,60 @@ RuntimeError: Simulated API failure
 2026-03-11 16:30:05,171 - INFO - Chosen strategy for XOM: Momentum (profit_prob Momentum=0.00, MA=0.00)
 2026-03-11 16:30:05,611 - INFO - Completed Momentum on XOM
 2026-03-11 16:30:05,612 - INFO - Daily BackTrace job finished
+2026-08-04 22:03:04,502 - INFO - Test job started (Momentum on AAPL)
+2026-08-04 22:03:04,502 - INFO - Test job completed successfully
+2026-08-04 22:03:04,503 - INFO - Daily BackTrace job started
+2026-08-04 22:03:04,504 - ERROR - Failed T1: Simulated API failure
+Traceback (most recent call last):
+  File "/Users/garv/projects/backtrace/live/scheduler.py", line 85, in run_daily_strategy
+    data = executor.get_historical_data(days=SELECTOR_LOOKBACK_DAYS)
+  File "/opt/homebrew/Cellar/python@3.14/3.14.1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/unittest/mock.py", line 1175, in __call__
+    return self._mock_call(*args, **kwargs)
+           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/unittest/mock.py", line 1179, in _mock_call
+    return self._execute_mock_call(*args, **kwargs)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/unittest/mock.py", line 1234, in _execute_mock_call
+    raise effect
+RuntimeError: Simulated API failure
+
+2026-08-04 22:03:04,504 - WARNING - Skipping T2: insufficient data
+2026-08-04 22:03:04,504 - INFO - Daily BackTrace job finished
+2026-08-04 22:03:20,182 - INFO - Test job started (Momentum on AAPL)
+2026-08-04 22:03:20,182 - INFO - Test job completed successfully
+2026-08-04 22:03:20,183 - INFO - Daily BackTrace job started
+2026-08-04 22:03:20,184 - ERROR - Failed T1: Simulated API failure
+Traceback (most recent call last):
+  File "/Users/garv/projects/backtrace/live/scheduler.py", line 85, in run_daily_strategy
+    data = executor.get_historical_data(days=SELECTOR_LOOKBACK_DAYS)
+  File "/opt/homebrew/Cellar/python@3.14/3.14.1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/unittest/mock.py", line 1175, in __call__
+    return self._mock_call(*args, **kwargs)
+           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/unittest/mock.py", line 1179, in _mock_call
+    return self._execute_mock_call(*args, **kwargs)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/unittest/mock.py", line 1234, in _execute_mock_call
+    raise effect
+RuntimeError: Simulated API failure
+
+2026-08-04 22:03:20,184 - WARNING - Skipping T2: insufficient data
+2026-08-04 22:03:20,184 - INFO - Daily BackTrace job finished
+2026-08-04 22:07:24,196 - INFO - Test job started (Momentum on AAPL)
+2026-08-04 22:07:24,198 - INFO - Test job completed successfully
+2026-08-04 22:07:24,199 - INFO - Daily BackTrace job started
+2026-08-04 22:07:24,200 - ERROR - Failed T1: Simulated API failure
+Traceback (most recent call last):
+  File "/Users/garv/projects/backtrace/live/scheduler.py", line 85, in run_daily_strategy
+    data = executor.get_historical_data(days=SELECTOR_LOOKBACK_DAYS)
+  File "/opt/homebrew/Cellar/python@3.14/3.14.1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/unittest/mock.py", line 1175, in __call__
+    return self._mock_call(*args, **kwargs)
+           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/unittest/mock.py", line 1179, in _mock_call
+    return self._execute_mock_call(*args, **kwargs)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/unittest/mock.py", line 1234, in _execute_mock_call
+    raise effect
+RuntimeError: Simulated API failure
+
+2026-08-04 22:07:24,200 - WARNING - Skipping T2: insufficient data
+2026-08-04 22:07:24,200 - INFO - Daily BackTrace job finished
