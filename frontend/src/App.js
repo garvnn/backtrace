@@ -851,6 +851,14 @@ function App() {
                 <span className="system-status-item">
                   <strong>Open tickers</strong> {tradeStats.openCount}
                 </span>
+                {portfolio?.multiplier != null && (
+                  <span className="system-status-item">
+                    <strong>Account</strong>{' '}
+                    <span className={portfolio.multiplier > 1 ? 'system-status-value-margin' : ''}>
+                      {portfolio.multiplier > 1 ? `Margin (${portfolio.multiplier}x)` : 'Cash'}
+                    </span>
+                  </span>
+                )}
               </div>
 
               <h2>Trading Summary</h2>

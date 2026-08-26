@@ -101,18 +101,46 @@ class Database:
         conn.close()
         print("Database initialized")
     
-    def log_trade(self, strategy, ticker, side, qty, price=None, order_id=None, status='submitted', params=None):
-        """Log a trade to database. params is optional dict stored as JSON (e.g. short_window, long_window, lookback_period)."""
+    def log_trade(self, strategy, ticker, side, qty, price=None, order_id=None, status='submitted', params=None, timestamp=None):
+        """Log a trade to database. params is optional dict stored as JSON (e.g. short_window, long_window, lookback_period).
+        timestamp defaults to now(); pass an explicit ISO timestamp when backfilling historical orders
+        (see sync_alpaca_fills.py, which reconciles real Alpaca order history into this table)."""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         params_json = json.dumps(params) if params is not None else None
+        ts = timestamp if timestamp is not None else datetime.now().isoformat()
         cursor.execute('''
             INSERT INTO trades (timestamp, strategy, ticker, side, qty, price, order_id, status, params)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (datetime.now().isoformat(), strategy, ticker, side, qty, price, order_id, status, params_json))
-        
+        ''', (ts, strategy, ticker, side, qty, price, order_id, status, params_json))
+
         conn.commit()
         conn.close()
+
+    def get_trade_by_order_id(self, order_id):
+        """Return (id, status, price) for the trade row matching order_id, or None if no row exists.
+        Used by sync_alpaca_fills.py to decide whether an Alpaca order needs an UPDATE (row exists,
+        fields stale) or an INSERT (order exists on Alpaca but was never logged locally)."""
+        if not order_id:
+            return None
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('SELECT id, status, price FROM trades WHERE order_id = ?', (order_id,))
+        row = cursor.fetchone()
+        conn.close()
+        return row
+
+    def update_trade_fill(self, order_id, status, price):
+        """Update status/price for an existing trade row matched by order_id. Used to reconcile the
+        submission-time status logged by execute_signal() with Alpaca's confirmed fill status/price
+        (see sync_alpaca_fills.py). Returns True if a row was updated."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('UPDATE trades SET status = ?, price = ? WHERE order_id = ?', (status, price, order_id))
+        updated = cursor.rowcount
+        conn.commit()
+        conn.close()
+        return updated > 0
     
     def log_portfolio_snapshot(self, strategy, portfolio_value, cash, positions):
         """Log current portfolio state."""

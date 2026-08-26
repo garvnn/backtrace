@@ -84,9 +84,63 @@ def _get_portfolio_from_alpaca():
             "positions": positions_dict,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "strategy": None,
+            # Risk/margin fields: fetched off the same `account` object above (no extra API call),
+            # but previously never read anywhere. multiplier > 1 means real margin is in play (this
+            # account's multiplier is 4x) — surfacing this is what would have caught cash going
+            # negative proactively instead of it showing up as a mystery.
+            "multiplier": float(account.multiplier) if getattr(account, "multiplier", None) is not None else None,
+            "shorting_enabled": bool(account.shorting_enabled) if getattr(account, "shorting_enabled", None) is not None else None,
+            "pattern_day_trader": bool(account.pattern_day_trader) if getattr(account, "pattern_day_trader", None) is not None else None,
+            "trading_blocked": bool(account.trading_blocked) if getattr(account, "trading_blocked", None) is not None else None,
+            "account_blocked": bool(account.account_blocked) if getattr(account, "account_blocked", None) is not None else None,
         }
     except Exception as e:
         logger.exception("Alpaca portfolio fetch failed: %s", e)
+        return None
+
+
+def _get_alpaca_portfolio_history(period: str = "6M", timeframe: str = "1D"):
+    """
+    Fetch Alpaca's own broker-verified daily equity history (client.get_portfolio_history()).
+    Alpaca already tracks this natively across the account's full trading history; the local
+    portfolio_snapshots table only gets a row when StrategyExecutor.run() executes a trade-decision
+    cycle, so it's sparse by comparison. Returns a list of dicts shaped like the local snapshot rows
+    ({timestamp, strategy, portfolio_value, cash, positions}), sorted chronologically, so callers can
+    use it as a drop-in replacement — cash/positions/strategy are None since Alpaca's history endpoint
+    only reports equity per timestamp. Returns None on missing keys or API failure (caller should fall
+    back to the local snapshot table), same graceful-fallback pattern as _get_portfolio_from_alpaca().
+    """
+    api_key = os.getenv("ALPACA_API_KEY")
+    secret_key = os.getenv("ALPACA_SECRET_KEY")
+    if not api_key or not secret_key:
+        return None
+    try:
+        from alpaca.trading.client import TradingClient
+        from alpaca.trading.requests import GetPortfolioHistoryRequest
+        client = TradingClient(api_key, secret_key, paper=True)
+        history = client.get_portfolio_history(
+            GetPortfolioHistoryRequest(period=period, timeframe=timeframe)
+        )
+        timestamps = getattr(history, "timestamp", None) or []
+        equity = getattr(history, "equity", None) or []
+        out = []
+        for ts, eq in zip(timestamps, equity):
+            # Alpaca zero-fills equity for calendar days before the account was funded (e.g. the
+            # requested period reaches back before account inception) -- skip those rather than
+            # plotting a fake drop-to-zero at the start of the chart.
+            if eq is None or float(eq) <= 0:
+                continue
+            out.append({
+                "timestamp": datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(),
+                "strategy": None,
+                "portfolio_value": float(eq),
+                "cash": None,
+                "positions": None,
+            })
+        out.sort(key=lambda x: x["timestamp"])
+        return out if out else None
+    except Exception as e:
+        logger.exception("Alpaca portfolio history fetch failed: %s", e)
         return None
 
 
@@ -114,6 +168,11 @@ def get_portfolio():
             "timestamp": None,
             "strategy": None,
             "live_sync_used": False,
+            "multiplier": None,
+            "shorting_enabled": None,
+            "pattern_day_trader": None,
+            "trading_blocked": None,
+            "account_blocked": None,
         }
     latest = history[-1]
     positions_raw = latest[5]
@@ -125,6 +184,13 @@ def get_portfolio():
         "timestamp": latest[1],
         "strategy": latest[2],
         "live_sync_used": False,
+        # Risk/margin fields aren't stored in the local snapshot table (see log_portfolio_snapshot),
+        # so they're unavailable on this fallback path -- only the live Alpaca path above has them.
+        "multiplier": None,
+        "shorting_enabled": None,
+        "pattern_day_trader": None,
+        "trading_blocked": None,
+        "account_blocked": None,
     }
 
 
@@ -250,10 +316,21 @@ def delete_trade(trade_id: int):
 
 
 @app.get("/portfolio-history")
-def get_portfolio_history_endpoint(strategy: str = None):
-    """Get portfolio value over time."""
+def get_portfolio_history_endpoint(strategy: str = None, period: str = "6M"):
+    """
+    Get portfolio value over time. Prefers Alpaca's broker-verified daily equity history (spans the
+    account's real trading history, e.g. ~124 points over 6 months) over the local portfolio_snapshots
+    table (which only gets a row per trade-decision cycle and today has just a handful of rows
+    clustered on one day). Falls back to the local snapshot table when Alpaca keys are missing or the
+    call fails. Alpaca's history is account-wide (not per-strategy), so the `strategy` filter only
+    applies to the local fallback path.
+    """
+    alpaca_history = _get_alpaca_portfolio_history(period=period)
+    if alpaca_history is not None:
+        return {"history": alpaca_history, "source": "alpaca"}
+
     history = db.get_portfolio_history(strategy=strategy)
-    
+
     history_list = []
     for snapshot in history:
         positions_raw = snapshot[5]
@@ -268,8 +345,8 @@ def get_portfolio_history_endpoint(strategy: str = None):
             "cash": snapshot[4],
             "positions": positions,
         })
-    
-    return {"history": history_list}
+
+    return {"history": history_list, "source": "db"}
 
 
 DAILY_BARS_MAX_POINTS = 500
