@@ -30,10 +30,21 @@ def _mock_trading_client():
     account.buying_power = 95000.0
     client.get_account.return_value = account
     client.get_all_positions.return_value = []
-    order = MagicMock()
-    order.id = "mock-order-id"
-    order.status = "accepted"
-    client.submit_order.return_value = order
+
+    def _submit(order_data):
+        # Alpaca echoes the submitted client_order_id back on the created order
+        # (generating one if the caller omitted it), so the mock does too - the
+        # executor persists that field and a bare MagicMock is not a value
+        # sqlite can bind.
+        order = MagicMock()
+        order.id = "mock-order-id"
+        order.status = "accepted"
+        order.client_order_id = getattr(order_data, "client_order_id", None) or "mock-client-order-id"
+        order.filled_qty = None
+        order.filled_avg_price = None
+        return order
+
+    client.submit_order.side_effect = _submit
     return client
 
 

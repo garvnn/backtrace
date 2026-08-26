@@ -413,6 +413,7 @@ def get_daily_bars(ticker: str, time_range: str = "1Y"):
 
 
 from trading_constants import INITIAL_CAPITAL
+from engine.fingerprint import backtest_fingerprint
 
 
 def _compute_spy_benchmark(start_date: str, end_date: str, initial_capital: float):
@@ -560,6 +561,87 @@ def _normalize_strategy_for_db(strategy: str) -> str:
     return s
 
 
+def _describe_backtest(row: dict) -> dict:
+    """Enough of a saved run to tell two of them apart in an error message."""
+    return {
+        "id": row.get("id"),
+        "created_at": row.get("created_at"),
+        "code_fingerprint": row.get("code_fingerprint"),
+        "total_return": row.get("total_return"),
+        "num_trades": row.get("num_trades"),
+        "start_date": row.get("start_date"),
+        "end_date": row.get("end_date"),
+    }
+
+
+def _select_backtest(results: list, backtest_id: Optional[int], ticker: str, strat_db: str):
+    """
+    Pick which saved backtest the live curve is compared against.
+
+    This used to be results[0] - whichever row happened to sort first. The
+    production database holds 27 runs of Momentum/AAPL over the same window
+    reporting three different total returns (+29.65% and +3.84%, all at n=49),
+    because the sizing code changed between them and nothing recorded which
+    version produced which row. An arbitrary row was therefore setting the
+    magnitude of the project's headline number.
+
+    Now: an explicit backtest_id always wins (the caller said which one), but
+    the response reports whether that run's code fingerprint still matches the
+    engine running now. Without an explicit id, only runs produced by the
+    current code are eligible, newest first; if none are, the endpoint refuses
+    and names the stale candidates rather than quietly comparing against code
+    that no longer exists.
+    """
+    current_fp = backtest_fingerprint()
+
+    if backtest_id is not None:
+        for r in results:
+            if r.get("id") == backtest_id:
+                return r, {
+                    "backtest_id_used": r.get("id"),
+                    "selected_by": "explicit_backtest_id",
+                    "current_code_fingerprint": current_fp,
+                    "backtest_code_fingerprint": r.get("code_fingerprint"),
+                    "code_fingerprint_match": r.get("code_fingerprint") == current_fp,
+                }
+        raise HTTPException(
+            status_code=422,
+            detail=f"backtest_id={backtest_id} not found for ticker={ticker} strategy={strat_db}",
+        )
+
+    matching = [r for r in results if r.get("code_fingerprint") == current_fp]
+    if not matching:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "no_comparable_backtest",
+                "message": (
+                    f"None of the {len(results)} saved backtest(s) for ticker={ticker} "
+                    f"strategy={strat_db} were produced by the current engine code "
+                    f"(fingerprint {current_fp}). Comparing live results against a run from "
+                    "different code attributes the gap to the strategy when it belongs to a "
+                    "code change. Re-run POST /backtest, or pass an explicit backtest_id to "
+                    "override."
+                ),
+                "current_code_fingerprint": current_fp,
+                "rejected_candidates": [_describe_backtest(r) for r in results[:10]],
+            },
+        )
+
+    chosen = matching[0]  # get_backtest_results orders by id DESC
+    return chosen, {
+        "backtest_id_used": chosen.get("id"),
+        "selected_by": "newest_matching_code_fingerprint",
+        "current_code_fingerprint": current_fp,
+        "backtest_code_fingerprint": chosen.get("code_fingerprint"),
+        "code_fingerprint_match": True,
+        "candidates_matching_code": len(matching),
+        "candidates_rejected_stale_code": [
+            _describe_backtest(r) for r in results if r.get("code_fingerprint") != current_fp
+        ][:10],
+    }
+
+
 @app.get("/divergence-analysis")
 def get_divergence_analysis(
     ticker: str,
@@ -592,19 +674,7 @@ def get_divergence_analysis(
             status_code=422,
             detail=f"No backtest results for ticker={ticker} strategy={strat_db}. Run POST /backtest first.",
         )
-    row = None
-    if backtest_id is not None:
-        for r in results:
-            if r.get("id") == backtest_id:
-                row = r
-                break
-        if row is None:
-            raise HTTPException(
-                status_code=422,
-                detail=f"backtest_id={backtest_id} not found for ticker={ticker} strategy={strat_db}",
-            )
-    else:
-        row = results[0]
+    row, selection = _select_backtest(results, backtest_id, ticker, strat_db)
 
     history = db.get_portfolio_history(strategy=None)
     report = build_full_report(
@@ -626,6 +696,7 @@ def get_divergence_analysis(
     report["strategy_query"] = strategy
     report["strategy_normalized"] = strat_db
     report["backtest_id"] = row.get("id")
+    report["backtest_selection"] = selection
     return report
 
 
@@ -702,11 +773,21 @@ def run_backtest(req: BacktestRequest):
             results = engine.run_pair(data_a, data_b, strategy)
             metrics = calculate_metrics(results)
             benchmark = _compute_spy_benchmark(start_date, end_date, engine.initial_capital)
-            db.save_backtest_results(
+            pair_params = {
+                "strategy": strategy_name,
+                "ticker_a": ticker,
+                "ticker_b": ticker_b,
+                "lookback": int(req.lookback) if req.lookback is not None else 60,
+                "entry_threshold": float(req.entry_threshold) if req.entry_threshold is not None else 2.0,
+                "exit_threshold": float(req.exit_threshold) if req.exit_threshold is not None else 0.5,
+            }
+            saved_id = db.save_backtest_results(
                 strategy_name, pair_ticker, start_date, end_date,
                 float(metrics["total_return"]), float(metrics["sharpe_ratio"]),
                 float(metrics["max_drawdown"]), int(metrics["num_trades"]),
                 results["portfolio_values"],
+                params=pair_params,
+                code_fingerprint=backtest_fingerprint(),
             )
             # Return the run we just computed (do not re-fetch from DB) so client always gets fresh result
             pv = results["portfolio_values"]
@@ -715,6 +796,8 @@ def run_backtest(req: BacktestRequest):
                 for i in range(len(pv))
             ]
             result = {
+                "id": saved_id,
+                "code_fingerprint": backtest_fingerprint(),
                 "ticker": pair_ticker,
                 "strategy": strategy_name,
                 "start_date": start_date,
@@ -750,12 +833,21 @@ def run_backtest(req: BacktestRequest):
         b = _compute_spy_benchmark(start_date, end_date, engine.initial_capital)
         if b:
             response_enrichment["benchmark"] = b
-        db.save_backtest_results(
+        saved_id = db.save_backtest_results(
             strategy_name, ticker, start_date, end_date,
             float(metrics["total_return"]), float(metrics["sharpe_ratio"]),
             float(metrics["max_drawdown"]), int(metrics["num_trades"]),
             results["portfolio_values"],
+            params={
+                "strategy": strategy_name,
+                "short_window": req.short_window,
+                "long_window": req.long_window,
+                "lookback_period": req.lookback_period,
+            },
+            code_fingerprint=backtest_fingerprint(),
         )
+        response_enrichment["id"] = saved_id
+        response_enrichment["code_fingerprint"] = backtest_fingerprint()
     except HTTPException:
         raise
     except Exception as e:

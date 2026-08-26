@@ -179,12 +179,53 @@ def test_pair_trades():
 
 
 def test_delete_trade_404():
-    """DELETE /trades/99999 -> 404."""
+    """DELETE /trades/99999 -> 404, once past the write gate."""
     from fastapi.testclient import TestClient
+    import api as api_module
     app = get_app_with_test_db()
     client = TestClient(app)
-    r = client.delete("/trades/99999")
-    assert r.status_code == 404
+    prev = api_module.API_KEY
+    api_module.API_KEY = "test-key"
+    try:
+        r = client.delete("/trades/99999", headers={"X-API-Key": "test-key"})
+        assert r.status_code == 404
+    finally:
+        api_module.API_KEY = prev
+    return True
+
+
+def test_write_endpoints_default_deny():
+    """With no BACKTRACE_API_KEY set, order placement and deletion are 503, not open."""
+    from fastapi.testclient import TestClient
+    import api as api_module
+    app = get_app_with_test_db()
+    client = TestClient(app)
+    prev = api_module.API_KEY
+    api_module.API_KEY = ""
+    try:
+        assert client.delete("/trades/99999").status_code == 503
+        r = client.post("/run-executor", json={"ticker": "AAPL", "strategy": "Momentum"})
+        assert r.status_code == 503, f"unauthenticated order placement returned {r.status_code}"
+    finally:
+        api_module.API_KEY = prev
+    return True
+
+
+def test_write_endpoints_reject_bad_key():
+    """With a key configured, a missing or wrong X-API-Key is 401."""
+    from fastapi.testclient import TestClient
+    import api as api_module
+    app = get_app_with_test_db()
+    client = TestClient(app)
+    prev = api_module.API_KEY
+    api_module.API_KEY = "test-key"
+    try:
+        assert client.delete("/trades/99999").status_code == 401
+        assert client.delete("/trades/99999", headers={"X-API-Key": "wrong"}).status_code == 401
+        r = client.post("/run-executor", json={"ticker": "AAPL"}, headers={"X-API-Key": "wrong"})
+        assert r.status_code == 401
+    finally:
+        api_module.API_KEY = prev
     return True
 
 
@@ -234,13 +275,24 @@ def test_live_benchmark():
 
 
 def test_run_executor_requires_ticker():
-    """POST /run-executor - without Stat Arb pair can run (or 400 if keys missing)."""
+    """POST /run-executor - with a valid key, reaches the handler."""
     from fastapi.testclient import TestClient
+    import api as api_module
     app = get_app_with_test_db()
     client = TestClient(app)
-    r = client.post("/run-executor", json={"ticker": "AAPL", "strategy": "Momentum"})
-    # 200 if ran, 400 if missing keys (ValueError), 500 on other
-    assert r.status_code in (200, 400, 500)
+    prev = api_module.API_KEY
+    api_module.API_KEY = "test-key"
+    try:
+        r = client.post(
+            "/run-executor",
+            json={"ticker": "AAPL", "strategy": "Momentum"},
+            headers={"X-API-Key": "test-key"},
+        )
+        # 200 if ran, 400 if missing Alpaca keys (ValueError), 500 on other.
+        # Anything but 401/503 proves the gate let an authenticated caller past.
+        assert r.status_code in (200, 400, 500), r.status_code
+    finally:
+        api_module.API_KEY = prev
     return True
 
 

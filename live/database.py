@@ -3,7 +3,7 @@ Database for storing trades and portfolio history.
 """
 
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 
 class Database:
@@ -84,7 +84,17 @@ class Database:
                 equity_curve TEXT
             )
         ''')
-        
+        # Additive migrations for backtest_results. Without params and
+        # code_fingerprint, two rows with the same (strategy, ticker, date range)
+        # are indistinguishable even when they disagree - which is exactly what
+        # happened: 27 saved runs, three different answers, no way to tell which
+        # code or which lookback produced any of them.
+        for column_ddl in ('params TEXT', 'code_fingerprint TEXT', 'created_at TEXT'):
+            try:
+                cursor.execute(f'ALTER TABLE backtest_results ADD COLUMN {column_ddl}')
+            except sqlite3.OperationalError:
+                pass  # column already exists
+
         # Pair trades table (stat arb)
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS pair_trades (
@@ -208,25 +218,40 @@ class Database:
         conn.commit()
         conn.close()
     
-    def save_backtest_results(self, strategy, ticker, start_date, end_date, 
-                             total_return, sharpe_ratio, max_drawdown, num_trades, equity_curve):
-        """Save backtest results for comparison."""
+    def save_backtest_results(self, strategy, ticker, start_date, end_date,
+                             total_return, sharpe_ratio, max_drawdown, num_trades, equity_curve,
+                             params=None, code_fingerprint=None):
+        """
+        Save a backtest run. Returns the new row id.
+
+        params and code_fingerprint are what make a saved run reproducible.
+        Without them, (strategy, ticker, start_date, end_date) is not a unique
+        key for a result - it is a query that can return several disagreeing
+        answers, and the caller has no way to tell which is which.
+        """
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
-        
+
         # Convert equity curve to JSON
         equity_curve_json = equity_curve.to_json()
-        
+        params_json = json.dumps(params) if params is not None else None
+
         cursor.execute('''
-            INSERT INTO backtest_results 
-            (strategy, ticker, start_date, end_date, total_return, sharpe_ratio, 
-             max_drawdown, num_trades, equity_curve)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO backtest_results
+            (strategy, ticker, start_date, end_date, total_return, sharpe_ratio,
+             max_drawdown, num_trades, equity_curve, params, code_fingerprint, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (strategy, ticker, start_date, end_date, total_return, sharpe_ratio,
-              max_drawdown, num_trades, equity_curve_json))
-        
+              max_drawdown, num_trades, equity_curve_json, params_json, code_fingerprint,
+              # UTC-aware. The rest of this table's timestamps are naive host-local
+              # time, which reads as one thing on a laptop in ET and another on
+              # Railway's UTC containers; new columns do not inherit that.
+              datetime.now(timezone.utc).isoformat()))
+
+        row_id = cursor.lastrowid
         conn.commit()
         conn.close()
+        return row_id
 
     def get_last_executed_signal(self, strategy, ticker):
         """Return 1 if most recent trade for (strategy, ticker) was BUY, 0 if SELL, None if no trades."""
@@ -369,7 +394,9 @@ class Database:
         """Get saved backtest results, optionally filtered by ticker and/or strategy."""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
-        query = 'SELECT id, strategy, ticker, start_date, end_date, total_return, sharpe_ratio, max_drawdown, num_trades, equity_curve FROM backtest_results'
+        query = ('SELECT id, strategy, ticker, start_date, end_date, total_return, sharpe_ratio, '
+                 'max_drawdown, num_trades, equity_curve, params, code_fingerprint, created_at '
+                 'FROM backtest_results')
         params = []
         clauses = []
         if ticker:
@@ -394,7 +421,11 @@ class Database:
                     for ts, val in ec_dict.items():
                         try:
                             ts_val = int(ts)
-                            ts_str = datetime.utcfromtimestamp(ts_val / 1000.0).strftime("%Y-%m-%d")
+                            # utcfromtimestamp is deprecated from Python 3.12;
+                            # this runs on 3.14 in production.
+                            ts_str = datetime.fromtimestamp(
+                                ts_val / 1000.0, tz=timezone.utc
+                            ).strftime("%Y-%m-%d")
                         except (ValueError, TypeError):
                             ts_str = str(ts)
                         equity_curve.append({"timestamp": ts_str, "portfolio_value": float(val)})
@@ -412,6 +443,11 @@ class Database:
                 "max_drawdown": row[7],
                 "num_trades": row[8],
                 "equity_curve": equity_curve,
+                # Rows saved before these columns existed carry None. Those runs
+                # are not reproducible and should not be compared against.
+                "params": json.loads(row[10]) if row[10] else None,
+                "code_fingerprint": row[11],
+                "created_at": row[12],
             })
         return out
 
