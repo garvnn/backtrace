@@ -28,12 +28,14 @@ from strategies.momentum import MomentumStrategy
 from strategies.stat_arb import StatArbStrategy
 from trading_constants import INITIAL_CAPITAL
 
-def profit_probability_from_backtest(portfolio_values):
-    """Fraction of days with a positive return. 0.0 if the series is too short."""
-    if portfolio_values is None or len(portfolio_values) < 2:
-        return 0.0
-    dr = portfolio_values.pct_change().dropna()
-    return float((dr > 0).mean()) if len(dr) else 0.0
+try:
+    from strategy_selector import profit_probability_from_backtest
+except ImportError:
+    def profit_probability_from_backtest(portfolio_values):
+        if portfolio_values is None or len(portfolio_values) < 2:
+            return 0.0
+        dr = portfolio_values.pct_change().dropna()
+        return float((dr > 0).mean()) if len(dr) else 0.0
 
 
 def _select_momentum_vs_ma_on_train(train: pd.DataFrame):
