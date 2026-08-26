@@ -43,9 +43,6 @@ TOP_10_SPY = [
     "XOM",
 ]
 
-# Lookback days for strategy selector backtest (Momentum vs MA)
-SELECTOR_LOOKBACK_DAYS = 60
-
 # Logging: file + console
 LOG_FILE = os.path.join(LIVE_DIR, "scheduler.log")
 _logger = None
@@ -69,11 +66,26 @@ def _get_logger():
 
 
 def run_daily_strategy():
-    """Run one strategy per ticker (Momentum or MA Crossover) chosen by profit probability. Stat Arb is not run live."""
+    """
+    Run Momentum on every ticker in the universe. Stat Arb is not run live.
+
+    Previously this asked strategy_selector.select_strategy_for_ticker to pick
+    Momentum vs MA Crossover per ticker. That selector could not work: it fit on
+    a 60-bar window split 70/30, giving 42 training rows, while Momentum needs a
+    120-bar lookback and MA Crossover a 200-bar one. Both therefore produced
+    all-zero signals, both profit probabilities came out exactly 0.00, the
+    tie-break compared 0.0 to 0.0, and Momentum won by default - every ticker,
+    every day. Production confirms it: 1,144 snapshots across 115 trading days
+    are all tagged Momentum, and every log line reads
+    "train prob M=0.00 MA=0.00; val prob M=0.00 MA=0.00".
+
+    Removed rather than repaired. A meta-selector is a real idea, but it needs
+    enough history to fit on and an out-of-sample test that can fail; adding one
+    back is a deliberate piece of work, not a bug fix. Running one strategy
+    honestly beats advertising a choice that never happened.
+    """
     from strategies.momentum import MomentumStrategy
-    from strategies.mean_reversion import MeanReversionStrategy
     from executor import StrategyExecutor, SessionBudget
-    from strategy_selector import select_strategy_for_ticker
     from trading_constants import BUYING_POWER_FRACTION
 
     log = _get_logger()
@@ -88,47 +100,40 @@ def run_daily_strategy():
     # Kept so the run can take exactly one account-level snapshot at the end.
     last_executor = None
 
+    # Settle the PREVIOUS run's orders before placing new ones. A DAY market
+    # order submitted at 16:30 fills at the next open, ~17 hours later, so there
+    # is nothing to poll at submit time - each run reconciles the last one.
+    try:
+        reconciler = StrategyExecutor(MomentumStrategy(), ticker=TOP_10_SPY[0])
+        changes = reconciler.reconcile_open_orders()
+        if changes:
+            filled = [c for c in changes if (c["status"] or "").lower() == "filled"]
+            log.info("Reconciled %d open order(s); %d now filled", len(changes), len(filled))
+            for c in filled:
+                if c["slippage"] is not None:
+                    log.info(
+                        "  %s %s: ref %.4f -> fill %.4f (slippage %+.4f)",
+                        c["ticker"], c["side"], float(c["reference_price"]),
+                        c["filled_avg_price"], c["slippage"],
+                    )
+        else:
+            log.info("No open orders to reconcile")
+    except Exception as recon_err:
+        log.error("Order reconciliation failed (continuing to trade): %s", recon_err)
+
     for ticker in TOP_10_SPY:
         try:
-            # Get data via executor (same source as live signals)
-            executor = StrategyExecutor(MomentumStrategy(), ticker=ticker)
-            data = executor.get_historical_data(days=SELECTOR_LOOKBACK_DAYS)
-            if data is None or (hasattr(data, "empty") and data.empty) or len(data) < 30:
-                log.warning("Skipping %s: insufficient data", ticker)
-                continue
-
-            (
-                winner_class,
-                prob_mom_tr,
-                prob_ma_tr,
-                prob_mom_val,
-                prob_ma_val,
-            ) = select_strategy_for_ticker(ticker, data, lookback_days=SELECTOR_LOOKBACK_DAYS)
-            winner_name = winner_class().name
-            log.info(
-                "Chosen strategy for %s: %s (train prob M=%.2f MA=%.2f; val prob M=%.2f MA=%.2f)",
-                ticker,
-                winner_name,
-                prob_mom_tr,
-                prob_ma_tr,
-                prob_mom_val,
-                prob_ma_val,
-            )
-
             if session_budget is None:
+                probe = StrategyExecutor(MomentumStrategy(), ticker=ticker)
                 try:
-                    cash = float(executor.trading_client.get_account().cash)
+                    cash = float(probe.trading_client.get_account().cash)
                     session_budget = SessionBudget(cash * BUYING_POWER_FRACTION)
                     log.info("Session capital budget for this run: $%.2f (from account cash $%.2f)", session_budget.remaining, cash)
                 except Exception as budget_err:
                     log.warning("Could not determine account cash for session budget cap; proceeding without a batch-level cap: %s", budget_err)
 
-            # Run executor with winning strategy
-            strategy = winner_class()
-            if isinstance(strategy, MeanReversionStrategy):
-                params = {"short_window": strategy.short_window, "long_window": strategy.long_window}
-            else:
-                params = {"lookback_period": strategy.lookback_period}
+            strategy = MomentumStrategy()
+            params = {"lookback_period": strategy.lookback_period}
             executor = StrategyExecutor(strategy, ticker=ticker, params=params, session_budget=session_budget)
             executor.run()
             last_executor = executor

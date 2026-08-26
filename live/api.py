@@ -12,7 +12,7 @@ sys.path.insert(0, LIVE_DIR)
 import logging
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from database import Database
@@ -27,14 +27,57 @@ load_dotenv(os.path.join(LIVE_DIR, ".env"))
 
 app = FastAPI()
 
-# Enable CORS for frontend
+# CORS. Set ALLOWED_ORIGINS to a comma-separated list of your frontend origins
+# in production, e.g. "https://backtrace.vercel.app". Defaults to "*" so local
+# development and the existing deployment keep working.
+#
+# allow_credentials is False whenever origins is "*": that combination is
+# invalid per the CORS spec and browsers reject the response, so the previous
+# allow_origins=["*"] with allow_credentials=True was not doing what it looked
+# like it was doing.
+_origins_env = os.getenv("ALLOWED_ORIGINS", "").strip()
+ALLOWED_ORIGINS = [o.strip() for o in _origins_env.split(",") if o.strip()] or ["*"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=ALLOWED_ORIGINS != ["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Write-side authentication.
+#
+# Two endpoints change state outside this process: POST /run-executor submits
+# real orders to Alpaca, and DELETE /trades/{id} destroys audit records. Both
+# were reachable by anyone who knew the URL, on a service the README tells you
+# to deploy publicly.
+#
+# Default-deny: unless BACKTRACE_API_KEY is set in the environment, they return
+# 503 and do nothing. When it is set, callers must send a matching X-API-Key.
+# Read-only GETs stay open so the dashboard keeps working unchanged.
+#
+# Note this intentionally disables the dashboard's "Run Strategy" button in a
+# public deployment. A browser button cannot hold a secret - shipping the key in
+# the frontend bundle would publish it - so an unauthenticated public button
+# that places brokerage orders cannot be made safe while staying a public
+# button. The scheduler places the real trades on its own; manual runs are a
+# convenience, available via curl with the key or by running locally.
+API_KEY = os.getenv("BACKTRACE_API_KEY", "").strip()
+
+
+def require_write_auth(x_api_key: str = Header(default=None, alias="X-API-Key")):
+    """Gate for endpoints that place orders or delete records."""
+    if not API_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Write endpoints are disabled. Set BACKTRACE_API_KEY in the server "
+                "environment to enable them, then send it as the X-API-Key header."
+            ),
+        )
+    if not x_api_key or x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Missing or invalid X-API-Key header.")
+    return True
 
 DB_PATH = os.getenv("DB_PATH") or os.path.join(LIVE_DIR, "trading.db")
 db = Database(DB_PATH)
@@ -242,8 +285,8 @@ def get_pair_trades(strategy: str = None):
 
 
 @app.delete("/trades/{trade_id}")
-def delete_trade(trade_id: int):
-    """Delete a trade by id."""
+def delete_trade(trade_id: int, _auth: bool = Depends(require_write_auth)):
+    """Delete a trade by id. Requires X-API-Key; destroys an audit record."""
     if not db.delete_trade(trade_id):
         raise HTTPException(status_code=404, detail="Trade not found")
     return {"ok": True}
@@ -381,13 +424,12 @@ def _compute_spy_benchmark(start_date: str, end_date: str, initial_capital: floa
     try:
         os.chdir(PROJECT_ROOT)
         from data.loader import load_data
-        from engine.backtest_engine import BacktestEngine
         from analytics.benchmark import equity_series_to_curve_list, metrics_from_equity_series
 
         spy_df = load_data("SPY", start_date, end_date)
         if spy_df is None or len(spy_df) == 0:
             return None
-        engine = BacktestEngine(initial_capital=initial_capital)
+        engine = _benchmark_engine(initial_capital)
         spy_results = engine.run_buyhold(spy_df)
         spy_pv = spy_results["portfolio_values"]
         m = metrics_from_equity_series(spy_pv, initial_capital)
@@ -407,9 +449,33 @@ def _compute_spy_benchmark(start_date: str, end_date: str, initial_capital: floa
         os.chdir(old)
 
 
+def _benchmark_engine(initial_capital: float):
+    """
+    Engine configured for an index benchmark: deploy the whole account.
+
+    The strategy engine caps each position at MAX_DOLLAR_PER_STOCK and holds back
+    1 - BUYING_POWER_FRACTION in cash. Those are risk limits on a strategy, not
+    properties of "what if I had just bought the index," but run_buyhold read the
+    same settings - so the SPY benchmark was buying $10,000 of SPY and leaving
+    $90,000 in cash. That reported SPY at roughly +36% over a stretch where it
+    actually returned several hundred percent, and made the strategy look
+    competitive with an index it was not competing with.
+
+    A strategy that leaves most of its capital idle SHOULD underperform a fully
+    invested index. That gap is a real result, so the benchmark deploys fully.
+    """
+    from engine.backtest_engine import BacktestEngine
+
+    return BacktestEngine(
+        initial_capital=initial_capital,
+        max_dollar_per_stock=float("inf"),
+        buying_power_fraction=1.0,
+    )
+
+
 def _spy_payload_for_live_window(start_date: str, end_inclusive: str):
     """
-    SPY buy-and-hold for the live-benchmark window.
+    SPY buy-and-hold over exactly [start_date, end_inclusive].
     end_inclusive is the last calendar day (inclusive); yfinance end is exclusive.
     """
     end_exclusive = (date.fromisoformat(end_inclusive) + timedelta(days=1)).isoformat()
@@ -417,13 +483,12 @@ def _spy_payload_for_live_window(start_date: str, end_inclusive: str):
     try:
         os.chdir(PROJECT_ROOT)
         from data.loader import load_data
-        from engine.backtest_engine import BacktestEngine
         from analytics.benchmark import equity_series_to_curve_list, metrics_from_equity_series
 
         spy_df = load_data("SPY", start_date, end_exclusive)
         if spy_df is None or len(spy_df) == 0:
             return None
-        engine = BacktestEngine(initial_capital=INITIAL_CAPITAL)
+        engine = _benchmark_engine(INITIAL_CAPITAL)
         spy_results = engine.run_buyhold(spy_df)
         spy_pv = spy_results["portfolio_values"]
         sm = metrics_from_equity_series(spy_pv, INITIAL_CAPITAL)
@@ -765,13 +830,21 @@ def get_live_benchmark(strategy: str = None, time_range: str = "1Y"):
         ]
         live_curve = _downsample_equity_curve(live_curve_full)
 
-        spy_payload = _spy_payload_for_live_window(start_date, end_inclusive)
+        # SPY spans exactly the live data, not the requested calendar window.
+        # time_range only selects WHICH snapshots to include; the benchmark must
+        # cover the same days those snapshots cover. Previously SPY used the raw
+        # window, so time_range=ALL (12 years) benchmarked 115 days of live
+        # trading against 12 years of SPY.
+        spy_start, spy_end = ts_list[0], ts_list[-1]
+        spy_payload = _spy_payload_for_live_window(spy_start, spy_end)
 
         lm = metrics_from_sparse_equity_points(ts_list, scaled_vals, INITIAL_CAPITAL)
         return {
-            "start_date": start_date,
-            "end_date": end_inclusive,
+            "start_date": spy_start,
+            "end_date": spy_end,
             "time_range": time_range,
+            "requested_window": {"start": start_date, "end": end_inclusive},
+            "aligned_to_live_data": True,
             "live_equity_curve": live_curve,
             "spy_equity_curve": spy_payload["equity_curve"] if spy_payload else [],
             "live": {
@@ -846,8 +919,8 @@ class RunExecutorRequest(BaseModel):
 
 
 @app.post("/run-executor")
-def run_executor(req: RunExecutorRequest = None):
-    """Run the strategy executor once (paper trade) with selected strategy and params."""
+def run_executor(req: RunExecutorRequest = None, _auth: bool = Depends(require_write_auth)):
+    """Run the strategy executor once (paper trade). Requires X-API-Key; submits real orders."""
     req = req or RunExecutorRequest()
     ticker = (req.ticker or "AAPL").strip().upper()
     strategy_name = req.strategy or "Momentum"

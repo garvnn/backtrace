@@ -28,14 +28,19 @@ from strategies.momentum import MomentumStrategy
 from strategies.stat_arb import StatArbStrategy
 from trading_constants import INITIAL_CAPITAL
 
-try:
-    from strategy_selector import profit_probability_from_backtest
-except ImportError:
-    def profit_probability_from_backtest(portfolio_values):
-        if portfolio_values is None or len(portfolio_values) < 2:
-            return 0.0
-        dr = portfolio_values.pct_change().dropna()
-        return float((dr > 0).mean()) if len(dr) else 0.0
+def profit_probability_from_backtest(portfolio_values):
+    """
+    Fraction of days with a positive return. 0.0 if the series is too short.
+
+    Was imported from live/strategy_selector.py behind a try/except. That module
+    is gone (its 60-bar fitting window could never feed a 120- or 200-bar
+    strategy, so it always returned Momentum), but the statistic itself is sound
+    and walk-forward validation here fits on windows large enough to use it.
+    """
+    if portfolio_values is None or len(portfolio_values) < 2:
+        return 0.0
+    dr = portfolio_values.pct_change().dropna()
+    return float((dr > 0).mean()) if len(dr) else 0.0
 
 
 def _select_momentum_vs_ma_on_train(train: pd.DataFrame):
