@@ -418,10 +418,15 @@ function App() {
     }
   };
 
+  // Live trades are keyed 'MA Crossover'; rows saved before the rename are
+  // keyed 'MeanReversion'. Comparing against only one of the two is what made
+  // MA trades render as momentum trades ("Lookback — days").
+  const isMACrossover = (name) => name === 'MA Crossover' || name === 'MeanReversion';
+
   const formatTradeParams = (trade) => {
     const p = trade.params;
     if (!p) return '—';
-    if (trade.strategy === 'MeanReversion') return `Short ${p.short_window} / Long ${p.long_window}`;
+    if (isMACrossover(trade.strategy)) return `Short ${p.short_window} / Long ${p.long_window}`;
     if (trade.strategy === 'Stat Arb') return `Lookback ${p.lookback ?? '—'}, entry ${p.entry_threshold ?? '—'}, exit ${p.exit_threshold ?? '—'}`;
     return `Lookback ${p.lookback_period ?? '—'} days`;
   };
@@ -1098,7 +1103,7 @@ function App() {
                     <div className="stat params-used">
                       <span className="label">Params used</span>
                       <span className="value params-text">
-                        {backtestResult.params_used.strategy === 'Stat Arb' ? `${backtestResult.params_used.ticker_a ?? backtestResult.ticker?.split('-')[0] ?? '—'}-${backtestResult.params_used.ticker_b ?? backtestResult.ticker?.split('-')[1] ?? '—'}, lookback ${backtestResult.params_used.lookback ?? '—'}, entry z ${backtestResult.params_used.entry_threshold ?? '—'}, exit z ${backtestResult.params_used.exit_threshold ?? '—'}` : backtestResult.params_used.strategy === 'MeanReversion' ? `Short MA ${backtestResult.params_used.short_window ?? '—'}, Long MA ${backtestResult.params_used.long_window ?? '—'}` : `Lookback ${backtestResult.params_used.lookback_period ?? '—'} days`}
+                        {backtestResult.params_used.strategy === 'Stat Arb' ? `${backtestResult.params_used.ticker_a ?? backtestResult.ticker?.split('-')[0] ?? '—'}-${backtestResult.params_used.ticker_b ?? backtestResult.ticker?.split('-')[1] ?? '—'}, lookback ${backtestResult.params_used.lookback ?? '—'}, entry z ${backtestResult.params_used.entry_threshold ?? '—'}, exit z ${backtestResult.params_used.exit_threshold ?? '—'}` : isMACrossover(backtestResult.params_used.strategy) ? `Short MA ${backtestResult.params_used.short_window ?? '—'}, Long MA ${backtestResult.params_used.long_window ?? '—'}` : `Lookback ${backtestResult.params_used.lookback_period ?? '—'} days`}
                       </span>
                     </div>
                   )}

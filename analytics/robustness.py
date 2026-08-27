@@ -23,7 +23,8 @@ from analytics.benchmark import (
     sharpe_from_daily_returns,
 )
 from engine.backtest_engine import BacktestEngine
-from strategies.mean_reversion import MeanReversionStrategy
+from strategies.ma_crossover import MACrossoverStrategy
+from strategies.naming import MA_CROSSOVER, STAT_ARB, canonical
 from strategies.momentum import MomentumStrategy
 from strategies.stat_arb import StatArbStrategy
 from trading_constants import INITIAL_CAPITAL
@@ -50,7 +51,7 @@ def _select_momentum_vs_ma_on_train(train: pd.DataFrame):
     engine = BacktestEngine()
     try:
         r_m = engine.run(train, MomentumStrategy())
-        r_a = engine.run(train, MeanReversionStrategy())
+        r_a = engine.run(train, MACrossoverStrategy())
     except Exception:
         return MomentumStrategy
     p_m = profit_probability_from_backtest(r_m.get("portfolio_values"))
@@ -58,8 +59,8 @@ def _select_momentum_vs_ma_on_train(train: pd.DataFrame):
     if abs(p_m - p_a) < 1e-6:
         ret_m = r_m.get("total_return", 0.0) or 0.0
         ret_a = r_a.get("total_return", 0.0) or 0.0
-        return MeanReversionStrategy if ret_a > ret_m else MomentumStrategy
-    return MeanReversionStrategy if p_a > p_m else MomentumStrategy
+        return MACrossoverStrategy if ret_a > ret_m else MomentumStrategy
+    return MACrossoverStrategy if p_a > p_m else MomentumStrategy
 
 
 def _walk_forward_stat_arb(
@@ -246,13 +247,13 @@ def parameter_sensitivity(
                             )
                         except Exception:
                             continue
-        elif strategy_name in ("MeanReversion", "MA Crossover"):
+        elif canonical(strategy_name) == MA_CROSSOVER:
             for sw in [max(5, int(round(x))) for x in pct_grid(float(base_short))]:
                 for lw in [max(sw + 1, int(round(x))) for x in pct_grid(float(base_long))]:
                     if sw >= lw:
                         continue
                     try:
-                        tr = float(engine.run(data, MeanReversionStrategy(sw, lw))["total_return"])
+                        tr = float(engine.run(data, MACrossoverStrategy(sw, lw))["total_return"])
                         returns.append(tr)
                         param_results.append({"short_window": sw, "long_window": lw, "total_return": tr})
                     except Exception:
@@ -470,8 +471,8 @@ def run_robustness_suite(
 
     rng = rng or np.random.default_rng()
     sym = (ticker or "").strip().upper()
-    sk = "MeanReversion" if strategy_name == "MA Crossover" else strategy_name
-    is_pair = sk == "Stat Arb" and "-" in sym
+    sk = canonical(strategy_name)
+    is_pair = sk == STAT_ARB and "-" in sym
     ta, tb = None, None
     if is_pair:
         parts = sym.split("-", 1)
@@ -533,8 +534,8 @@ def run_robustness_suite(
                     data_b,
                     StatArbStrategy(ta, tb, stat_lookback, entry_threshold, exit_threshold),
                 )["portfolio_values"]
-            elif sk == "MeanReversion":
-                eq = eng.run(data, MeanReversionStrategy(short_window, long_window))["portfolio_values"]
+            elif sk == MA_CROSSOVER:
+                eq = eng.run(data, MACrossoverStrategy(short_window, long_window))["portfolio_values"]
             else:
                 eq = eng.run(data, MomentumStrategy(lookback_period))["portfolio_values"]
         except Exception:

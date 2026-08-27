@@ -135,7 +135,7 @@ def run_all_tickers_mock_only():
     """
     import pandas as pd
     from strategies.momentum import MomentumStrategy
-    from strategies.mean_reversion import MeanReversionStrategy
+    from strategies.ma_crossover import MACrossoverStrategy
 
     results = []
     for ticker in TOP_10_SPY:

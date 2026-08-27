@@ -391,7 +391,14 @@ class Database:
         return history
 
     def get_backtest_results(self, ticker=None, strategy=None):
-        """Get saved backtest results, optionally filtered by ticker and/or strategy."""
+        """
+        Get saved backtest results, optionally filtered by ticker and/or strategy.
+
+        strategy accepts a string or a sequence of spellings. Rows written
+        before the MA Crossover rename are stored as "MeanReversion", so a
+        single-string exact match would hide them - callers pass
+        strategies.naming.storage_aliases() to see both.
+        """
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         query = ('SELECT id, strategy, ticker, start_date, end_date, total_return, sharpe_ratio, '
@@ -403,8 +410,13 @@ class Database:
             clauses.append('ticker = ?')
             params.append(ticker)
         if strategy:
-            clauses.append('strategy = ?')
-            params.append(strategy)
+            names = [strategy] if isinstance(strategy, str) else list(strategy)
+            if len(names) == 1:
+                clauses.append('strategy = ?')
+                params.append(names[0])
+            else:
+                clauses.append('strategy IN (%s)' % ','.join('?' * len(names)))
+                params.extend(names)
         if clauses:
             query += ' WHERE ' + ' AND '.join(clauses)
         query += ' ORDER BY id DESC'

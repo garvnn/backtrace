@@ -414,6 +414,7 @@ def get_daily_bars(ticker: str, time_range: str = "1Y"):
 
 from trading_constants import INITIAL_CAPITAL
 from engine.fingerprint import backtest_fingerprint
+from strategies.naming import canonical as strategy_canonical, storage_aliases
 
 
 def _compute_spy_benchmark(start_date: str, end_date: str, initial_capital: float):
@@ -554,11 +555,15 @@ def get_performance(strategy: str = None):
 
 
 def _normalize_strategy_for_db(strategy: str) -> str:
-    """Saved backtests use MeanReversion; UI may send MA Crossover."""
-    s = (strategy or "Momentum").strip()
-    if s == "MA Crossover":
-        return "MeanReversion"
-    return s
+    """
+    Canonical strategy name for a request.
+
+    Kept as a thin wrapper so the endpoints read the same as before; the
+    mapping itself now lives in strategies/naming.py rather than being
+    reimplemented at each call site. Reads should query with
+    naming.storage_aliases() so pre-rename "MeanReversion" rows stay visible.
+    """
+    return strategy_canonical(strategy)
 
 
 def _describe_backtest(row: dict) -> dict:
@@ -668,7 +673,7 @@ def get_divergence_analysis(
     if not ticker:
         raise HTTPException(status_code=400, detail="ticker is required")
     strat_db = _normalize_strategy_for_db(strategy)
-    results = db.get_backtest_results(ticker=ticker, strategy=strat_db)
+    results = db.get_backtest_results(ticker=ticker, strategy=storage_aliases(strat_db))
     if not results:
         raise HTTPException(
             status_code=422,
@@ -718,13 +723,15 @@ def _build_strategy(strategy_name: str, short_window: int, long_window: int, loo
                     ticker_a: str = None, ticker_b: str = None, lookback: int = 60,
                     entry_threshold: float = 2.0, exit_threshold: float = 0.5):
     from strategies.momentum import MomentumStrategy
-    from strategies.mean_reversion import MeanReversionStrategy
+    from strategies.ma_crossover import MACrossoverStrategy
     from strategies.stat_arb import StatArbStrategy
-    if strategy_name == "Stat Arb" and ticker_a and ticker_b:
+    from strategies.naming import MA_CROSSOVER, STAT_ARB
+    name = strategy_canonical(strategy_name)
+    if name == STAT_ARB and ticker_a and ticker_b:
         return StatArbStrategy(ticker_a=ticker_a, ticker_b=ticker_b, lookback=lookback,
                                entry_threshold=entry_threshold, exit_threshold=exit_threshold)
-    if strategy_name == "MeanReversion" or strategy_name == "MA Crossover":
-        return MeanReversionStrategy(short_window=short_window, long_window=long_window)
+    if name == MA_CROSSOVER:
+        return MACrossoverStrategy(short_window=short_window, long_window=long_window)
     return MomentumStrategy(lookback_period=lookback_period)
 
 
@@ -736,9 +743,8 @@ def run_backtest(req: BacktestRequest):
         raise HTTPException(status_code=400, detail="ticker is required")
     start_date = req.start_date
     end_date = req.end_date
-    strategy_name = req.strategy or "Momentum"
-    if strategy_name == "MA Crossover":
-        strategy_name = "MeanReversion"
+    # Canonical from here down: this is what gets written to backtest_results.
+    strategy_name = strategy_canonical(req.strategy)
     is_stat_arb = strategy_name == "Stat Arb"
     if is_stat_arb:
         ticker_b = (req.ticker_b or "").strip().upper()
@@ -854,7 +860,7 @@ def run_backtest(req: BacktestRequest):
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         os.chdir(old_cwd)
-    saved = db.get_backtest_results(ticker=ticker, strategy=strategy_name)
+    saved = db.get_backtest_results(ticker=ticker, strategy=storage_aliases(strategy_name))
     result = dict(saved[0]) if saved else {}
     result["equity_curve"] = _downsample_equity_curve(result.get("equity_curve") or [])
     result["params_used"] = {
@@ -957,7 +963,9 @@ def get_live_benchmark(strategy: str = None, time_range: str = "1Y"):
 @app.get("/backtest-results")
 def get_backtest_results(ticker: str = None, strategy: str = None):
     """Get saved backtest results, optionally filtered by ticker and/or strategy. Equity curves are downsampled."""
-    results = db.get_backtest_results(ticker=ticker, strategy=strategy)
+    results = db.get_backtest_results(
+        ticker=ticker, strategy=storage_aliases(strategy) if strategy else None
+    )
     for r in results:
         r["equity_curve"] = _downsample_equity_curve(r.get("equity_curve") or [])
     return {"results": results}
@@ -971,8 +979,9 @@ def get_monte_carlo(ticker: str, strategy: str = "Momentum", runs: int = 10000):
     """
     from analytics.monte_carlo import run_monte_carlo
 
-    normalized_strategy = "MeanReversion" if strategy == "MA Crossover" else strategy
-    results = db.get_backtest_results(ticker=ticker.strip().upper(), strategy=normalized_strategy)
+    results = db.get_backtest_results(
+        ticker=ticker.strip().upper(), strategy=storage_aliases(strategy)
+    )
 
     if not results:
         return {"error": "No backtest results found. Run backtest first."}
@@ -1015,9 +1024,7 @@ def run_executor(req: RunExecutorRequest = None, _auth: bool = Depends(require_w
     """Run the strategy executor once (paper trade). Requires X-API-Key; submits real orders."""
     req = req or RunExecutorRequest()
     ticker = (req.ticker or "AAPL").strip().upper()
-    strategy_name = req.strategy or "Momentum"
-    if strategy_name == "MA Crossover":
-        strategy_name = "MeanReversion"
+    strategy_name = strategy_canonical(req.strategy)
     ticker_a = ticker
     ticker_b = None
     if strategy_name == "Stat Arb":

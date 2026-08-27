@@ -1,9 +1,9 @@
 """
 Daily strategy executor - runs at market close (4:30 PM ET) on weekdays.
 
-Runs one strategy per ticker (Momentum or MA Crossover) on top 10 SPY tickers. The strategy
-is chosen per ticker by profit probability from a short lookback backtest. Stat Arb is not
-run live; it remains available for backtesting only.
+Runs Momentum on each of the top 10 SPY tickers. Stat Arb is not run live; it remains
+available for backtesting only. See run_daily_strategy for why there is no longer a
+per-ticker strategy choice.
 Logs to scheduler.log and console. Errors for one ticker do not stop the rest.
 
 Usage:

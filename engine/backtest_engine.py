@@ -279,9 +279,9 @@ if __name__ == "__main__":
     print(f"Final Value: ${float(results['portfolio_values'].iloc[-1]):,.2f}")
     print(f"Total Return: {results['total_return']:.2%}")
 
-    from strategies.mean_reversion import MeanReversionStrategy
+    from strategies.ma_crossover import MACrossoverStrategy
 
-    strategy = MeanReversionStrategy()
+    strategy = MACrossoverStrategy()
     results_strategy = engine.run(data, strategy)
 
     print(f"\n--- Strategy Results ---")

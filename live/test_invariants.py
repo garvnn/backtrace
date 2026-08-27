@@ -22,7 +22,7 @@ sys.path.insert(0, PROJECT_ROOT)
 sys.path.insert(0, LIVE_DIR)
 
 from database import Database
-from strategies.mean_reversion import MeanReversionStrategy
+from strategies.ma_crossover import MACrossoverStrategy
 from strategies.momentum import MomentumStrategy
 from strategies.stat_arb import StatArbStrategy
 from trading_constants import MAX_DOLLAR_PER_STOCK
@@ -316,7 +316,7 @@ def test_signals_are_valid_values():
     momentum = MomentumStrategy(lookback_period=120)
     _assert_valid_signals(momentum.generate_signals(data), "Momentum")
 
-    ma_cross = MeanReversionStrategy(short_window=50, long_window=200)
+    ma_cross = MACrossoverStrategy(short_window=50, long_window=200)
     _assert_valid_signals(ma_cross.generate_signals(data), "MA Crossover")
 
     stat_arb = StatArbStrategy("AAPL", "MSFT", lookback=60)

@@ -20,7 +20,7 @@ import numpy as np
 import pandas as pd
 
 from strategies.momentum import MomentumStrategy
-from strategies.mean_reversion import MeanReversionStrategy
+from strategies.ma_crossover import MACrossoverStrategy
 from strategies.stat_arb import StatArbStrategy
 
 from database import Database
