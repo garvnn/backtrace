@@ -4,6 +4,7 @@ Strategy executor - runs BackTrace strategies live.
 
 import os
 import sys
+import time
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 
@@ -24,6 +25,11 @@ from strategies.ma_crossover import MACrossoverStrategy
 from strategies.stat_arb import StatArbStrategy
 
 from database import Database
+from snapshot_health import (
+    EMPTY_POSITIONS_VALUE_IS_CASH,
+    SNAPSHOT_RETRY_DELAY_SECONDS,
+    reconcile_snapshot,
+)
 from trading_constants import (
     MAX_DOLLAR_PER_STOCK,
     BUYING_POWER_FRACTION,
@@ -638,6 +644,26 @@ class StrategyExecutor:
 
         return changes
 
+    def _read_account_state(self):
+        """(portfolio_value, cash, positions, positions_market_value, held_count)."""
+        account = self.trading_client.get_account()
+        raw_positions = self.trading_client.get_all_positions()
+        positions = {}
+        market_value = 0.0
+        for pos in raw_positions:
+            qty = _to_float(getattr(pos, "qty", None))
+            if qty is None or qty == 0:
+                continue
+            positions[pos.symbol] = qty
+            market_value += _to_float(getattr(pos, "market_value", None)) or 0.0
+        return (
+            _to_float(account.portfolio_value),
+            _to_float(account.cash),
+            positions,
+            market_value,
+            len(positions),
+        )
+
     def log_portfolio_snapshot(self):
         """
         Record one account-level snapshot (portfolio value, cash, all positions).
@@ -648,15 +674,63 @@ class StrategyExecutor:
         making "daily" returns actually intra-run returns. Callers own the
         cadence: the scheduler snapshots once after its ticker loop, and the
         single-run API endpoint snapshots once after its one run.
+
+        The reading is reconciled before it is persisted. On 2026-07-07 Alpaca
+        returned portfolio_value == cash with an empty position list, sampled at
+        16:30 ET before positions were marked, between two days that held six
+        positions worth ~$105k. That row was written verbatim and produced a
+        61% drawdown in every metric computed off the live curve, against an
+        actual return of +1.65%. An equity curve is only worth what its worst
+        point is worth, so a point that does not add up is not recorded.
         """
-        account = self.trading_client.get_account()
-        positions = {pos.symbol: float(pos.qty) for pos in self.trading_client.get_all_positions()}
+        value, cash, positions, market_value, held = self._read_account_state()
+
+        ok, reason, detail = reconcile_snapshot(value, cash, market_value, held)
+
+        # A mid-mark reading is transient: the positions are there, they just
+        # have not been marked yet. One re-read a moment later resolves it, and
+        # is much cheaper than losing the day's snapshot.
+        if not ok or reason == EMPTY_POSITIONS_VALUE_IS_CASH:
+            print(f"Snapshot did not reconcile ({reason}); re-reading account...")
+            time.sleep(SNAPSHOT_RETRY_DELAY_SECONDS)
+            value, cash, positions, market_value, held = self._read_account_state()
+            ok, reason, detail = reconcile_snapshot(value, cash, market_value, held)
+
+        if not ok:
+            # Refusing to write is the right failure here. A missing day leaves
+            # a gap in a curve that is already sparse and handled; a wrong day
+            # silently corrupts every metric derived from it.
+            print(f"REFUSING to record snapshot: {reason} {detail}")
+            self._log_execution_event(
+                ticker="ACCOUNT",
+                signal="N/A",
+                action="NO_SNAPSHOT",
+                reason=reason,
+                details=detail,
+            )
+            return None
+
+        if reason == EMPTY_POSITIONS_VALUE_IS_CASH:
+            # Still flat after the re-read, so the account really is flat and
+            # value == cash is the correct description of it. Logged because
+            # the same shape is what the defect produces, and a reader
+            # comparing against the previous row deserves to know which it was.
+            self._log_execution_event(
+                ticker="ACCOUNT",
+                signal="N/A",
+                action="SNAPSHOT_FLAT",
+                reason=reason,
+                details=detail,
+            )
+
         self.db.log_portfolio_snapshot(
             strategy=self.strategy.name,
-            portfolio_value=float(account.portfolio_value),
-            cash=float(account.cash),
-            positions=positions
+            portfolio_value=value,
+            cash=cash,
+            positions=positions,
+            data_quality=reason,
         )
+        return reason
 
     def run(self):
         """Run strategy and execute trades. Does not snapshot; see log_portfolio_snapshot."""

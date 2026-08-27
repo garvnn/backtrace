@@ -28,9 +28,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import urllib.request
 from collections import OrderedDict
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
+sys.path.insert(0, os.path.join(ROOT, "live"))
+
+from snapshot_health import clean_series
 
 
 def load_from_url(base_url: str) -> list[dict]:
@@ -173,6 +180,31 @@ def describe(history: list[dict], label: str) -> None:
             "      its cash, so a large drop with nothing held points at the snapshot rather\n"
             "      than the market."
         )
+
+    # Re-measure with data-quality defects excluded - the same filter the API
+    # applies, so this prints what the dashboard will now report.
+    kept, excluded = clean_series(points)
+    print(f"\n{'-' * 72}")
+    if not excluded:
+        print("Data quality: all snapshots reconcile. The drawdown above stands.")
+        return
+    print(f"Data quality: {len(excluded)} of {len(points)} snapshots excluded as defective")
+    for e in excluded[:10]:
+        print(f"  {e['timestamp'][:10]}  {float(e['portfolio_value']):>14,.2f}  {e['status']}")
+    corrected = max_drawdown(kept)
+    print()
+    print(f"Corrected max drawdown : {corrected['drawdown'] * 100:+.2f}%"
+          if corrected else "Corrected max drawdown : none")
+    if corrected:
+        print(f"  peak   {corrected['peak']['timestamp'][:10]}  "
+              f"{float(corrected['peak']['portfolio_value']):>14,.2f}")
+        print(f"  trough {corrected['trough']['timestamp'][:10]}  "
+              f"{float(corrected['trough']['portfolio_value']):>14,.2f}")
+    if kept:
+        f, l = float(kept[0]["portfolio_value"]), float(kept[-1]["portfolio_value"])
+        if f:
+            print(f"Corrected return       : {(l / f - 1.0) * 100:+.2f}%")
+    print("\nThese are the numbers to quote. The excluded rows stay in the database.")
 
 
 def main() -> int:

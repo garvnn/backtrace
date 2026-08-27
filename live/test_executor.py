@@ -336,3 +336,121 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+def _account(portfolio_value, cash):
+    a = MagicMock()
+    a.portfolio_value = portfolio_value
+    a.cash = cash
+    a.buying_power = float(cash) * 2
+    return a
+
+
+def _position(symbol, qty, market_value):
+    p = MagicMock()
+    p.symbol = symbol
+    p.qty = qty
+    p.market_value = market_value
+    return p
+
+
+def _snapshot_executor(db_path, account_reads, position_reads):
+    """Executor whose account/position reads are scripted per call."""
+    from strategies.momentum import MomentumStrategy
+    from database import Database
+    from executor import StrategyExecutor
+
+    client = MagicMock()
+    client.get_account.side_effect = list(account_reads)
+    client.get_all_positions.side_effect = list(position_reads)
+
+    db = Database(db_path)
+    db.get_last_executed_signal = MagicMock(return_value=None)
+    with patch.dict(os.environ, {"ALPACA_API_KEY": "x", "ALPACA_SECRET_KEY": "y"}, clear=False):
+        with patch("executor.TradingClient", return_value=client):
+            with patch("executor.Database", return_value=db):
+                ex = StrategyExecutor(MomentumStrategy(), ticker="AAPL")
+    ex.trading_client = client
+    ex.db = db
+    return ex, db
+
+
+def test_snapshot_refused_when_value_omits_positions():
+    """
+    The 2026-07-07 production defect: Alpaca reports portfolio_value == cash
+    while six positions are held. Persisting that row put a 61% drawdown on a
+    curve whose real return is +1.65%, so it must not be written.
+    """
+    import snapshot_health
+
+    held = [_position("AAPL", 10, 62_534.06)]
+    fd, db_path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    try:
+        # Both reads bad: the retry does not rescue it.
+        ex, db = _snapshot_executor(
+            db_path,
+            account_reads=[_account(43_135.33, 43_135.33), _account(43_135.33, 43_135.33)],
+            position_reads=[held, held],
+        )
+        with patch.object(snapshot_health, "SNAPSHOT_RETRY_DELAY_SECONDS", 0):
+            with patch("executor.SNAPSHOT_RETRY_DELAY_SECONDS", 0):
+                result = ex.log_portfolio_snapshot()
+
+        assert result is None, "refusal must be signalled to the caller"
+        assert db.get_portfolio_history() == [], "no snapshot row may be written"
+        logs = db.get_execution_logs()
+        assert any(
+            (row[5] if not isinstance(row, dict) else row.get("action")) == "NO_SNAPSHOT"
+            for row in logs
+        ), "the refusal must be recorded in execution_logs"
+    finally:
+        os.path.exists(db_path) and os.remove(db_path)
+    return True
+
+
+def test_snapshot_retry_rescues_a_mid_mark_reading():
+    """The defect is transient, so one re-read should recover the real state."""
+    import snapshot_health
+
+    held = [_position("AAPL", 10, 62_534.06)]
+    fd, db_path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    try:
+        ex, db = _snapshot_executor(
+            db_path,
+            account_reads=[_account(43_135.33, 43_135.33), _account(105_669.41, 43_135.35)],
+            position_reads=[[], held],
+        )
+        with patch.object(snapshot_health, "SNAPSHOT_RETRY_DELAY_SECONDS", 0):
+            with patch("executor.SNAPSHOT_RETRY_DELAY_SECONDS", 0):
+                result = ex.log_portfolio_snapshot()
+
+        assert result == "ok"
+        history = db.get_portfolio_history()
+        assert len(history) == 1
+        assert abs(float(history[0][3]) - 105_669.41) < 0.01, "the good read must be the one stored"
+    finally:
+        os.path.exists(db_path) and os.remove(db_path)
+    return True
+
+
+def test_healthy_snapshot_written_normally():
+    import snapshot_health
+
+    held = [_position("AAPL", 10, 62_534.06)]
+    fd, db_path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    try:
+        ex, db = _snapshot_executor(
+            db_path,
+            account_reads=[_account(105_669.41, 43_135.35)],
+            position_reads=[held],
+        )
+        with patch.object(snapshot_health, "SNAPSHOT_RETRY_DELAY_SECONDS", 0):
+            result = ex.log_portfolio_snapshot()
+        assert result == "ok"
+        assert len(db.get_portfolio_history()) == 1
+    finally:
+        os.path.exists(db_path) and os.remove(db_path)
+    return True

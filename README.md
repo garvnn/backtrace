@@ -96,9 +96,10 @@ Open:
   (contract written up in `docs/execution-layer-spec.md`; the module itself is not built).
 - Stat Arb pair execution submits its two legs sequentially with no compensating action if the
   second is rejected. It is not run live, which is why this is not urgent.
-- The live equity curve shows a 61% peak-to-trough drawdown that the +1.68% overall return does
-  not explain. It survives daily-resampling, so it is not a snapshot-cadence artifact. Cause not
-  yet established; it is not being reported as a strategy result until it is.
+- Live and backtest sizing read different account fields: the backtest sizes off cash, the
+  executor off `buying_power`, which is roughly 2x equity on a margin account. The $10k
+  per-stock cap usually binds first on the single-ticker path, but the pair path has no cap
+  and runs about 2x the backtest's leverage.
 
 Closed recently:
 
@@ -109,6 +110,14 @@ Closed recently:
 - ~~The API is unauthenticated~~ — `POST /run-executor` and `DELETE /trades/{id}` require
   `X-API-Key` and default to denying when `BACKTRACE_API_KEY` is unset. CORS origins are
   configurable rather than `*`.
+- ~~A 61% drawdown on the live curve~~ — diagnosed, and it was a data-quality defect, not a
+  strategy result. On 2026-07-07 at 16:30 ET, the minute the scheduler fires, Alpaca returned
+  `portfolio_value == cash` with an empty position list, between two days holding six positions
+  worth ~$105k. That single row was written verbatim and set the max drawdown for the entire
+  curve. Snapshots are now reconciled against the marked value of what is held before being
+  persisted, with one retry for the transient case; readings that do not add up are refused and
+  logged rather than recorded. Historical rows are excluded from metrics by shape rather than
+  deleted, and `/live-benchmark` reports how many it dropped.
 - ~~Per-ticker strategy selection~~ — advertised but never functioned: it fit on 42 training
   rows while the strategies need 120 and 200, so both scored exactly 0.00 and Momentum won the
   tie every time, for every ticker, across all 115 days. Removed rather than papered over.

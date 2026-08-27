@@ -415,6 +415,7 @@ def get_daily_bars(ticker: str, time_range: str = "1Y"):
 from trading_constants import INITIAL_CAPITAL
 from engine.fingerprint import backtest_fingerprint
 from strategies.naming import canonical as strategy_canonical, storage_aliases
+from snapshot_health import clean_series
 
 
 def _compute_spy_benchmark(start_date: str, end_date: str, initial_capital: float):
@@ -887,8 +888,27 @@ def get_live_benchmark(strategy: str = None, time_range: str = "1Y"):
         pv = float(snap[3])
         d = (ts_raw or "")[:10]
         if d and start_date <= d <= end_inclusive:
-            points.append({"timestamp": d, "portfolio_value": pv})
+            positions_raw = snap[5] if len(snap) > 5 else None
+            try:
+                positions = json.loads(positions_raw) if positions_raw else {}
+            except (TypeError, json.JSONDecodeError):
+                positions = {}
+            points.append({
+                "timestamp": d,
+                "portfolio_value": pv,
+                "cash": float(snap[4]) if snap[4] is not None else 0.0,
+                "positions": positions,
+            })
     points.sort(key=lambda x: x["timestamp"])
+
+    # Drop readings that do not describe a state the account can be in before
+    # any metric is computed off them. On 2026-07-07 Alpaca returned
+    # portfolio_value == cash with no positions, sampled mid-mark at the close
+    # between two days holding ~$105k; that single row put a 61% max drawdown
+    # on a curve whose actual return is +1.65%. Excluded, not deleted - the row
+    # stays in the table as evidence about the feed, and the response reports
+    # how many were dropped so the number is never silently massaged.
+    points, excluded_points = clean_series(points)
     trades = db.get_all_trades(strategy=strategy)
     num_trades = len(trades)
 
@@ -914,6 +934,11 @@ def get_live_benchmark(strategy: str = None, time_range: str = "1Y"):
                 "no_history": True,
             },
             "spy": spy_payload,
+            "data_quality": {
+                "snapshots_used": 0,
+                "snapshots_excluded": len(excluded_points),
+                "excluded": excluded_points[:20],
+            },
         }
 
     try:
@@ -954,6 +979,11 @@ def get_live_benchmark(strategy: str = None, time_range: str = "1Y"):
                 "avg_return_per_trade": None,
             },
             "spy": spy_payload,
+            "data_quality": {
+                "snapshots_used": len(points),
+                "snapshots_excluded": len(excluded_points),
+                "excluded": excluded_points[:20],
+            },
         }
     except Exception as e:
         logger.exception("live-benchmark failed: %s", e)

@@ -95,6 +95,16 @@ class Database:
             except sqlite3.OperationalError:
                 pass  # column already exists
 
+        # Additive migration for portfolio_snapshots. data_quality records
+        # whether a snapshot reconciled at write time; see live/snapshot_health.py.
+        # Existing rows are left NULL, meaning "written before this check
+        # existed" rather than "verified good" - the read side treats NULL as
+        # unknown and classifies those rows by shape instead.
+        try:
+            cursor.execute('ALTER TABLE portfolio_snapshots ADD COLUMN data_quality TEXT')
+        except sqlite3.OperationalError:
+            pass  # column already exists
+
         # Pair trades table (stat arb)
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS pair_trades (
@@ -205,16 +215,27 @@ class Database:
         conn.close()
         return changed > 0
     
-    def log_portfolio_snapshot(self, strategy, portfolio_value, cash, positions):
-        """Log current portfolio state."""
+    def log_portfolio_snapshot(self, strategy, portfolio_value, cash, positions,
+                               data_quality=None):
+        """
+        Log current portfolio state.
+
+        data_quality is the verdict from snapshot_health.reconcile_snapshot at
+        write time. Callers should not persist a snapshot that failed to
+        reconcile at all; this records which of the passing outcomes it was, so
+        a flat account and a mid-mark reading that merely looks flat can be
+        told apart later.
+        """
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
-        
+
         cursor.execute('''
-            INSERT INTO portfolio_snapshots (timestamp, strategy, portfolio_value, cash, positions)
-            VALUES (?, ?, ?, ?, ?)
-        ''', (datetime.now().isoformat(), strategy, portfolio_value, cash, json.dumps(positions)))
-        
+            INSERT INTO portfolio_snapshots
+                (timestamp, strategy, portfolio_value, cash, positions, data_quality)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (datetime.now().isoformat(), strategy, portfolio_value, cash,
+              json.dumps(positions), data_quality))
+
         conn.commit()
         conn.close()
     
