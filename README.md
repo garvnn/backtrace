@@ -93,13 +93,14 @@ Open:
 - No market-hours or holiday gating (`get_clock` / `get_calendar` are not called).
 - No retry or rate-limit handling on Alpaca calls.
 - Live and backtest position sizing are implemented separately rather than sharing one module
-  (contract written up in `docs/execution-layer-spec.md`; the module itself is not built).
+  (contract written up in `docs/execution-layer-spec.md`; the module itself is not built), and
+  they read different account fields: the backtest sizes off cash, the executor off
+  `buying_power`, which is roughly 2x equity on a margin account. The $10k per-stock cap
+  usually binds first on the single-ticker path, but the account has gone cash-negative in
+  production (-$6,830 on 2026-07-10), so the cap is not always holding. The pair path has no
+  cap at all and runs about 2x the backtest's leverage.
 - Stat Arb pair execution submits its two legs sequentially with no compensating action if the
   second is rejected. It is not run live, which is why this is not urgent.
-- Live and backtest sizing read different account fields: the backtest sizes off cash, the
-  executor off `buying_power`, which is roughly 2x equity on a margin account. The $10k
-  per-stock cap usually binds first on the single-ticker path, but the pair path has no cap
-  and runs about 2x the backtest's leverage.
 
 Closed recently:
 
