@@ -87,23 +87,38 @@ Tracked honestly rather than described as working.
 
 Open:
 
-- Market data uses Alpaca's default feed (IEX on the free plan), not consolidated tape. This is
-  one of the things the vendor-divergence analysis is meant to measure, but the code should say
-  which feed it is on rather than relying on the server default.
-- No market-hours or holiday gating (`get_clock` / `get_calendar` are not called).
-- No retry or rate-limit handling on Alpaca calls.
-- Live and backtest position sizing are implemented separately rather than sharing one module
-  (contract written up in `docs/execution-layer-spec.md`; the module itself is not built), and
-  they read different account fields: the backtest sizes off cash, the executor off
-  `buying_power`, which is roughly 2x equity on a margin account. The $10k per-stock cap
-  usually binds first on the single-ticker path, but the account has gone cash-negative in
-  production (-$6,830 on 2026-07-10), so the cap is not always holding. The pair path has no
-  cap at all and runs about 2x the backtest's leverage.
 - Stat Arb pair execution submits its two legs sequentially with no compensating action if the
-  second is rejected. It is not run live, which is why this is not urgent.
+  second is rejected, and its legs carry no `client_order_id`, so unlike every other order they
+  cannot safely be retried. It is not run live, which is why this is not urgent — but it is the
+  one remaining place an order can go wrong quietly.
+- `live/api.py` calls `os.chdir()` in five endpoints so relative imports resolve. That is
+  process-global, so concurrent requests can corrupt each other's working directory. The real
+  fix is a package with a `pyproject.toml`.
+- `live/pairs_finder.py` runs a real cointegration test and nothing imports it, while
+  `pairs_config.py` describes its hand-picked pairs as "pre-validated". Wire one into the other
+  or delete it; the current state overclaims.
 
 Closed recently:
 
+- ~~Live and backtest sized positions separately~~ — one `SizingPolicy` in `trading/sizing.py`
+  now serves both, and a parity test asserts they return identical share counts across a
+  capital × price grid. The executor reads `account.cash` for single names and `account.equity`
+  for pair legs, never `buying_power` — the margin allowance it used to size against, which is
+  what drove production cash to −$6,830.22 on 2026-07-10. Measured before the fix: identical at
+  $100k capital where the $10k cap binds, but 31 shares vs 63 at $5k, and 2.11× on pair legs.
+- ~~No market-hours or holiday gating~~ — `get_calendar()` gates the daily job, so it no longer
+  runs on Thanksgiving or July 4th, and half-days are detected and logged. An unreadable
+  calendar is reported as unknown and the run proceeds; treating a metadata outage as a holiday
+  would silently skip a real session.
+- ~~No retry or rate-limit handling~~ — `live/alpaca_retry.py` wraps every Alpaca call with
+  exponential backoff and jitter on 429/5xx, and does not retry other 4xx. Order submission is
+  retried only because each order carries a deterministic `client_order_id` that the broker
+  rejects on duplicate; the pair legs, which have none, are deliberately excluded.
+- ~~Market data feed was never specified~~ — `feed=` is now explicit and defaults to IEX, which
+  is what the free plan serves. Set `ALPACA_DATA_FEED=sip` with a paid subscription. This
+  matters because the Alpaca-vs-Yahoo close divergence the project measures is partly a
+  consequence of IEX being a few percent of consolidated volume; leaving the feed to a server
+  default meant the measurement had an unstated variable in it.
 - ~~Orders are never polled~~ — `reconcile_open_orders` settles the previous run's orders at the
   start of the next one, recording terminal status, `filled_qty`, `filled_avg_price` and signed
   slippage. A DAY market order submitted at 16:30 fills at the next open ~17 hours later, so

@@ -13,10 +13,10 @@ from alpaca.trading.client import TradingClient
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
-from alpaca.data.enums import Adjustment
+from alpaca.data.enums import Adjustment, DataFeed
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import numpy as np
 import pandas as pd
 
@@ -30,8 +30,25 @@ from snapshot_health import (
     SNAPSHOT_RETRY_DELAY_SECONDS,
     reconcile_snapshot,
 )
+from alpaca_retry import with_retry
 from trading.sizing import SessionBudget, SizingPolicy, default_policy
-from trading_constants import PAIR_CAPITAL_FRACTION
+from trading_constants import ALPACA_DATA_FEED, PAIR_CAPITAL_FRACTION
+
+
+def _resolve_feed():
+    """
+    Which market-data feed to request, explicitly.
+
+    Left unset, the server picks - IEX on the free plan. Since this project
+    measures Alpaca-vs-Yahoo close divergence, the feed is a variable in the
+    measurement, not an implementation detail to inherit silently.
+    """
+    name = (os.getenv("ALPACA_DATA_FEED") or ALPACA_DATA_FEED or "iex").strip().lower()
+    try:
+        return DataFeed(name)
+    except ValueError:
+        print(f"Unknown ALPACA_DATA_FEED {name!r}; falling back to IEX")
+        return DataFeed.IEX
 
 # Load .env from live/ so it works when run as "python live/executor.py" from project root
 LIVE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -105,10 +122,20 @@ class StrategyExecutor:
         request = StockBarsRequest(
             symbol_or_symbols=syms,
             timeframe=TimeFrame.Day,
-            start=datetime.now() - timedelta(days=days),
+            # UTC, not host-local. datetime.now() without a tz asks for a
+            # window whose meaning depends on where the process runs - this
+            # trades a New York market from UTC containers, and was developed
+            # on a laptop in Eastern. StockBarsRequest strips the tzinfo when
+            # it normalises, so req.start reads naive afterwards; the value it
+            # keeps is the UTC one.
+            start=datetime.now(timezone.utc) - timedelta(days=days),
             adjustment=Adjustment.ALL,
+            feed=_resolve_feed(),
         )
-        bars = self.data_client.get_stock_bars(request)
+        bars = with_retry(
+            lambda: self.data_client.get_stock_bars(request),
+            description=f"get_stock_bars({','.join(syms)})",
+        )
         df = getattr(bars, 'df', pd.DataFrame())
         if df.empty:
             return (pd.DataFrame(), pd.DataFrame()) if len(syms) == 2 else pd.DataFrame()
@@ -173,7 +200,9 @@ class StrategyExecutor:
         skip the ticker instead, which is the safe outcome.
         """
         sym = symbol if symbol is not None else self.ticker
-        positions = self.trading_client.get_all_positions()
+        positions = with_retry(
+            self.trading_client.get_all_positions, description="get_all_positions"
+        )
         for pos in positions:
             if pos.symbol == sym:
                 return float(pos.qty)
@@ -206,7 +235,7 @@ class StrategyExecutor:
         trading/sizing.py.
         """
         current_position = self.get_current_position()
-        account = self.trading_client.get_account()
+        account = with_retry(self.trading_client.get_account, description="get_account")
         # Cash, not buying_power. buying_power on a margin paper account is
         # roughly 2x equity, and sizing against it is what drove production
         # cash to -$6,830.22 on 2026-07-10 while the backtest, sizing off cash,
@@ -236,7 +265,10 @@ class StrategyExecutor:
                     time_in_force=TimeInForce.DAY,
                     client_order_id=self._client_order_id('BUY'),
                 )
-                order = self.trading_client.submit_order(order_data)
+                order = with_retry(
+                    lambda: self.trading_client.submit_order(order_data),
+                    description=f"submit_order(BUY {self.ticker})",
+                )
                 print(f"BUY order placed: {qty} shares")
                 if self.session_budget is not None:
                     self.session_budget.reserve(qty * current_price)
@@ -299,7 +331,10 @@ class StrategyExecutor:
                 time_in_force=TimeInForce.DAY,
                 client_order_id=self._client_order_id('SELL'),
             )
-            order = self.trading_client.submit_order(order_data)
+            order = with_retry(
+                lambda: self.trading_client.submit_order(order_data),
+                description=f"submit_order(SELL {self.ticker})",
+            )
             print(f"SELL order placed: {current_position} shares")
 
             # Log to database. price is the decision-time close, not the fill:
@@ -370,7 +405,7 @@ class StrategyExecutor:
         pos_b = self.get_current_position(ticker_b)
         price_a = float(data_a['Close'].iloc[-1])
         price_b = float(data_b['Close'].iloc[-1])
-        account = self.trading_client.get_account()
+        account = with_retry(self.trading_client.get_account, description="get_account")
         # Equity, not buying_power. The backtest sizes a spread leg off equity
         # (equity * capital_fraction * pair_fraction); reading buying_power
         # here made the live pair path run about 2x the backtest's leverage,
@@ -586,7 +621,10 @@ class StrategyExecutor:
         changes = []
         for row in open_orders:
             try:
-                order = self.trading_client.get_order_by_id(row["order_id"])
+                order = with_retry(
+                    lambda: self.trading_client.get_order_by_id(row["order_id"]),
+                    description=f"get_order_by_id({row['order_id']})",
+                )
             except Exception as e:
                 print(f"Could not fetch order {row['order_id']} for {row['ticker']}: {e}")
                 continue
@@ -632,8 +670,10 @@ class StrategyExecutor:
 
     def _read_account_state(self):
         """(portfolio_value, cash, positions, positions_market_value, held_count)."""
-        account = self.trading_client.get_account()
-        raw_positions = self.trading_client.get_all_positions()
+        account = with_retry(self.trading_client.get_account, description="get_account")
+        raw_positions = with_retry(
+            self.trading_client.get_all_positions, description="get_all_positions"
+        )
         positions = {}
         market_value = 0.0
         for pos in raw_positions:
@@ -747,6 +787,14 @@ class StrategyExecutor:
         current_signal = signals.iloc[-1]
         print(f"Latest signal: {current_signal}")
         self.execute_signal(current_signal, data)
+
+    # Note on the pair path below: its submit_order calls are deliberately NOT
+    # wrapped in with_retry. Retrying a submission is only safe because every
+    # single-name order carries a deterministic client_order_id that Alpaca will
+    # reject on a duplicate. The pair legs pass no client_order_id, so a retry
+    # after a timeout - where the first request may well have succeeded - could
+    # open a second leg and leave the spread unbalanced. Retries here wait on
+    # the guarded pair execution the README lists as an open gap.
 
     def _run_pair(self):
         """Pair flow (Stat Arb): fetch both, generate signals, execute both legs."""

@@ -65,6 +65,16 @@ def _get_logger():
     return logger
 
 
+def _calendar_probe(strategy_cls, executor_cls):
+    """
+    A trading client to ask about the calendar, before any ticker work starts.
+
+    Constructing an executor is how this module gets an authenticated client;
+    the ticker it is given is irrelevant to a calendar lookup.
+    """
+    return executor_cls(strategy_cls(), ticker=TOP_10_SPY[0]).trading_client
+
+
 def run_daily_strategy():
     """
     Run Momentum on every ticker in the universe. Stat Arb is not run live.
@@ -86,11 +96,39 @@ def run_daily_strategy():
     """
     from strategies.momentum import MomentumStrategy
     from executor import StrategyExecutor
+    from market_calendar import UNKNOWN, describe_session
     from trading.sizing import SessionBudget
     from trading_constants import CAPITAL_FRACTION
 
     log = _get_logger()
     log.info("Daily BackTrace job started")
+
+    # Is today actually a session? The cron is Mon-Fri, which includes
+    # Thanksgiving, July 4th and Christmas. On those days the run used to
+    # proceed normally - stale bars, a signal off them, orders queued to the
+    # next real session - and was saved from placing duplicates only by the
+    # idempotency check, which is a different mechanism doing this one's job.
+    #
+    # An unreadable calendar does not stop the run. Refusing to trade because a
+    # metadata endpoint is down would be its own failure; it is logged as
+    # unknown and recorded on the run.
+    session = None
+    try:
+        session = describe_session(_calendar_probe(MomentumStrategy, StrategyExecutor))
+        if session["status"] == "closed":
+            log.info("Market closed today (%s) - no trading, no snapshot", session["date"])
+            log.info("Daily BackTrace job finished")
+            return
+        if session["status"] == UNKNOWN:
+            log.warning("Could not read market calendar (%s); proceeding", session.get("error"))
+        else:
+            log.info(
+                "Session %s open %s close %s%s",
+                session["date"], session.get("session_open"), session.get("session_close"),
+                " (half day)" if session.get("is_half_day") else "",
+            )
+    except Exception as cal_err:
+        log.warning("Market calendar check failed (%s); proceeding", cal_err)
 
     # Shared across every ticker in this run: caps total new-BUY dollars at
     # actual account cash, not the (possibly margin-leveraged) buying_power
