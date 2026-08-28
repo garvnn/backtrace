@@ -85,8 +85,9 @@ def run_daily_strategy():
     honestly beats advertising a choice that never happened.
     """
     from strategies.momentum import MomentumStrategy
-    from executor import StrategyExecutor, SessionBudget
-    from trading_constants import BUYING_POWER_FRACTION
+    from executor import StrategyExecutor
+    from trading.sizing import SessionBudget
+    from trading_constants import CAPITAL_FRACTION
 
     log = _get_logger()
     log.info("Daily BackTrace job started")
@@ -127,7 +128,7 @@ def run_daily_strategy():
                 probe = StrategyExecutor(MomentumStrategy(), ticker=ticker)
                 try:
                     cash = float(probe.trading_client.get_account().cash)
-                    session_budget = SessionBudget(cash * BUYING_POWER_FRACTION)
+                    session_budget = SessionBudget(cash * CAPITAL_FRACTION)
                     log.info("Session capital budget for this run: $%.2f (from account cash $%.2f)", session_budget.remaining, cash)
                 except Exception as budget_err:
                     log.warning("Could not determine account cash for session budget cap; proceeding without a batch-level cap: %s", budget_err)

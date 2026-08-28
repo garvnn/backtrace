@@ -30,11 +30,8 @@ from snapshot_health import (
     SNAPSHOT_RETRY_DELAY_SECONDS,
     reconcile_snapshot,
 )
-from trading_constants import (
-    MAX_DOLLAR_PER_STOCK,
-    BUYING_POWER_FRACTION,
-    PAIR_CAPITAL_FRACTION,
-)
+from trading.sizing import SessionBudget, SizingPolicy, default_policy
+from trading_constants import PAIR_CAPITAL_FRACTION
 
 # Load .env from live/ so it works when run as "python live/executor.py" from project root
 LIVE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -75,39 +72,17 @@ def _bars_to_backtrace_df(df_one):
     return df
 
 
-class SessionBudget:
-    """
-    Tracks cumulative dollars available for new BUYs across a batch of tickers
-    processed in a single scheduler run (see scheduler.py run_daily_strategy).
-
-    Without this, each ticker's buy is capped only against MAX_DOLLAR_PER_STOCK
-    and the account's buying_power — and buying_power on a margin account can
-    be several times actual cash. A batch of independently-capped buys can
-    then collectively deploy more real cash than the account holds, drawing
-    on margin with no one buy ever looking oversized. This ties all buys in
-    one run to a single shared, cash-based ceiling.
-
-    Only wired into the single-ticker path (execute_signal); pair execution
-    (Stat Arb) is not run in a batch loop today, so it doesn't need this.
-    """
-
-    def __init__(self, total):
-        self.remaining = max(0.0, float(total))
-
-    def reserve(self, amount):
-        """Deduct up to `amount` from the remaining budget. Returns the amount actually deducted."""
-        amount = max(0.0, float(amount))
-        granted = min(amount, self.remaining)
-        self.remaining -= granted
-        return granted
-
-
 class StrategyExecutor:
-    def __init__(self, strategy, ticker='AAPL', params=None, session_budget=None):
+    def __init__(self, strategy, ticker='AAPL', params=None, session_budget=None,
+                 sizing=None):
         self.strategy = strategy
         self.ticker = ticker
         self.params = params  # optional dict e.g. short_window, long_window, lookback_period for logging
         self.session_budget = session_budget  # optional SessionBudget shared across a batch run
+        # The same policy BacktestEngine sizes with, so a given (capital,
+        # price) pair produces the same share count on both sides. Overridable
+        # for tests; see trading/sizing.py for why this is shared at all.
+        self.sizing = sizing if sizing is not None else default_policy()
         api_key = os.getenv('ALPACA_API_KEY')
         secret_key = os.getenv('ALPACA_SECRET_KEY')
         if not api_key or not secret_key:
@@ -223,10 +198,20 @@ class StrategyExecutor:
         )
     
     def execute_signal(self, signal, data):
-        """Place order based on signal. Only acts on signal change (idempotent); caps BUY at MAX_DOLLAR_PER_STOCK."""
+        """
+        Place an order when the signal changes. Idempotent on signal state.
+
+        Sizing goes through self.sizing, the same SizingPolicy the backtest
+        uses, against account cash rather than buying_power - see
+        trading/sizing.py.
+        """
         current_position = self.get_current_position()
         account = self.trading_client.get_account()
-        buying_power = float(account.buying_power)
+        # Cash, not buying_power. buying_power on a margin paper account is
+        # roughly 2x equity, and sizing against it is what drove production
+        # cash to -$6,830.22 on 2026-07-10 while the backtest, sizing off cash,
+        # modelled nothing of the sort. See trading/sizing.py.
+        available_capital = float(account.cash)
         last_signal = self.db.get_last_executed_signal(self.strategy.name, self.ticker)
         
         print(f"\nCurrent position: {current_position} shares")
@@ -235,14 +220,12 @@ class StrategyExecutor:
         
         # Signal = 1 (buy), 0 (sell/flat). Only place order when signal changed from last executed.
         if signal == 1 and current_position == 0 and last_signal != 1:
-            # Buy: cap at MAX_DOLLAR_PER_STOCK per stock, and at whatever's left of the
-            # shared session budget (if any) so a multi-ticker batch can't collectively
-            # spend more real cash than the account holds — see SessionBudget.
-            dollar_amount = min(MAX_DOLLAR_PER_STOCK, buying_power * BUYING_POWER_FRACTION)
+            # Same policy object the backtest sizes with, so an identical
+            # (capital, price) pair yields an identical share count on both
+            # sides. That parity is asserted in live/test_sizing.py.
             session_budget_remaining = self.session_budget.remaining if self.session_budget is not None else None
-            if session_budget_remaining is not None:
-                dollar_amount = min(dollar_amount, session_budget_remaining)
-            qty = int(dollar_amount / current_price)
+            dollar_amount = self.sizing.notional(available_capital, session_budget_remaining)
+            qty = self.sizing.shares(available_capital, current_price, session_budget_remaining)
 
             if qty > 0:
                 fill_model = self._fill_model()
@@ -279,10 +262,10 @@ class StrategyExecutor:
                     details={
                         "current_position": current_position,
                         "last_executed_signal": last_signal,
-                        "buying_power": buying_power,
+                        "available_capital": available_capital,
                         "price": current_price,
                         "qty": qty,
-                        "max_dollar_per_stock": MAX_DOLLAR_PER_STOCK,
+                        "max_dollar_per_stock": self.sizing.max_notional_per_symbol,
                         "session_budget_remaining_before": session_budget_remaining,
                         "params": self.params,
                     },
@@ -297,10 +280,10 @@ class StrategyExecutor:
                 details={
                     "current_position": current_position,
                     "last_executed_signal": last_signal,
-                    "buying_power": buying_power,
+                    "available_capital": available_capital,
                     "price": current_price,
                     "computed_qty": qty,
-                    "max_dollar_per_stock": MAX_DOLLAR_PER_STOCK,
+                    "max_dollar_per_stock": self.sizing.max_notional_per_symbol,
                     "session_budget_remaining": session_budget_remaining,
                     "params": self.params,
                 },
@@ -371,7 +354,7 @@ class StrategyExecutor:
                 details={
                     "current_position": current_position,
                     "last_executed_signal": last_signal,
-                    "buying_power": buying_power,
+                    "available_capital": available_capital,
                     "price": current_price,
                     "params": self.params,
                 },
@@ -388,9 +371,12 @@ class StrategyExecutor:
         price_a = float(data_a['Close'].iloc[-1])
         price_b = float(data_b['Close'].iloc[-1])
         account = self.trading_client.get_account()
-        buying_power = float(account.buying_power)
-        # Use half of allocated capital for the pair (equal dollar legs)
-        capital = buying_power * PAIR_CAPITAL_FRACTION
+        # Equity, not buying_power. The backtest sizes a spread leg off equity
+        # (equity * capital_fraction * pair_fraction); reading buying_power
+        # here made the live pair path run about 2x the backtest's leverage,
+        # unmeasured, in the one place the project can least afford it.
+        available_capital = float(account.equity)
+        capital = self.sizing.pair_notional(available_capital, PAIR_CAPITAL_FRACTION)
         lookback = getattr(self.strategy, 'lookback', 60)
         if len(data_a) >= lookback and len(data_b) >= lookback:
             pa = data_a['Close'].iloc[-lookback:].values.astype(float)
@@ -416,7 +402,7 @@ class StrategyExecutor:
                     "price_a": price_a,
                     "price_b": price_b,
                     "beta": beta,
-                    "buying_power": buying_power,
+                    "available_capital": available_capital,
                     "params": self.params,
                 },
             )

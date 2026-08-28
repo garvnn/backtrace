@@ -457,7 +457,7 @@ def _benchmark_engine(initial_capital: float):
     Engine configured for an index benchmark: deploy the whole account.
 
     The strategy engine caps each position at MAX_DOLLAR_PER_STOCK and holds back
-    1 - BUYING_POWER_FRACTION in cash. Those are risk limits on a strategy, not
+    1 - CAPITAL_FRACTION in cash. Those are risk limits on a strategy, not
     properties of "what if I had just bought the index," but run_buyhold read the
     same settings - so the SPY benchmark was buying $10,000 of SPY and leaving
     $90,000 in cash. That reported SPY at roughly +36% over a stretch where it
@@ -472,7 +472,7 @@ def _benchmark_engine(initial_capital: float):
     return BacktestEngine(
         initial_capital=initial_capital,
         max_dollar_per_stock=float("inf"),
-        buying_power_fraction=1.0,
+        capital_fraction=1.0,
     )
 
 

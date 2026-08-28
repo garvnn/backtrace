@@ -11,10 +11,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 import pandas as pd
 
+from trading.sizing import SizingPolicy
 from trading_constants import (
     INITIAL_CAPITAL,
     MAX_DOLLAR_PER_STOCK,
-    BUYING_POWER_FRACTION,
+    CAPITAL_FRACTION,
     PAIR_CAPITAL_FRACTION,
     DEFAULT_COMMISSION,
 )
@@ -26,7 +27,7 @@ class BacktestEngine:
         initial_capital=None,
         commission=None,
         max_dollar_per_stock=None,
-        buying_power_fraction=None,
+        capital_fraction=None,
         pair_capital_fraction=None,
     ):
         self.initial_capital = float(initial_capital if initial_capital is not None else INITIAL_CAPITAL)
@@ -34,11 +35,17 @@ class BacktestEngine:
         self.max_dollar_per_stock = float(
             max_dollar_per_stock if max_dollar_per_stock is not None else MAX_DOLLAR_PER_STOCK
         )
-        self.buying_power_fraction = float(
-            buying_power_fraction if buying_power_fraction is not None else BUYING_POWER_FRACTION
+        self.capital_fraction = float(
+            capital_fraction if capital_fraction is not None else CAPITAL_FRACTION
         )
         self.pair_capital_fraction = float(
             pair_capital_fraction if pair_capital_fraction is not None else PAIR_CAPITAL_FRACTION
+        )
+        # The same object the live executor sizes with. Sharing the policy is
+        # what makes a backtest/live share count comparable; see trading/sizing.py.
+        self.sizing = SizingPolicy(
+            max_notional_per_symbol=self.max_dollar_per_stock,
+            capital_fraction=self.capital_fraction,
         )
 
     def run_buyhold(self, data):
@@ -57,8 +64,7 @@ class BacktestEngine:
             exec_open = float(opens.iloc[i])
             ref_close = float(closes.iloc[i - 1])
             if shares == 0 and exec_open > 0 and ref_close > 0:
-                dollar = min(self.max_dollar_per_stock, cash * self.buying_power_fraction)
-                qty = int(dollar / ref_close)
+                qty = self.sizing.shares(cash, ref_close)
                 if qty > 0:
                     gross = qty * exec_open
                     cash -= gross * (1.0 + self.commission)
@@ -99,8 +105,7 @@ class BacktestEngine:
 
             if sig_prev == 1 and shares == 0 and exec_open > 0 and ref_close > 0:
                 entry_invested = cash
-                dollar = min(self.max_dollar_per_stock, cash * self.buying_power_fraction)
-                qty = int(dollar / ref_close)
+                qty = self.sizing.shares(cash, ref_close)
                 if qty > 0:
                     gross = qty * exec_open
                     cash -= gross * (1.0 + self.commission)
@@ -173,8 +178,7 @@ class BacktestEngine:
             else:
                 refa, refb = float(ca.iloc[i - 1]), float(cb.iloc[i - 1])
             equity = cash + shares_a * refa + shares_b * refb
-            bp = max(0.0, equity) * self.buying_power_fraction
-            return bp * self.pair_capital_fraction, refa, refb
+            return self.sizing.pair_notional(equity, self.pair_capital_fraction), refa, refb
 
         def open_long_spread(i):
             nonlocal cash, shares_a, shares_b, trades, state, entry_pv

@@ -225,7 +225,7 @@ def _run_same_bar_close_fill(data: pd.DataFrame, strategy, engine_params: dict) 
     cash = float(engine_params.get("initial_capital", INITIAL_CAPITAL))
     commission = float(engine_params.get("commission", DEFAULT_COMMISSION))
     max_dollar = float(engine_params.get("max_dollar_per_stock", engine_params.get("max_dollar", 10_000)))
-    bp = float(engine_params.get("buying_power_fraction", 0.95))
+    bp = float(engine_params.get("capital_fraction", 0.95))
     shares = 0
 
     for i in range(len(data)):
@@ -286,7 +286,7 @@ def estimate_execution_timing_impact(
             "initial_capital": engine.initial_capital,
             "commission": engine.commission,
             "max_dollar_per_stock": engine.max_dollar_per_stock,
-            "buying_power_fraction": engine.buying_power_fraction,
+            "capital_fraction": engine.capital_fraction,
         },
     )
     return {
