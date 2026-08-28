@@ -90,12 +90,17 @@ Open:
 - `live/api.py` calls `os.chdir()` in five endpoints so relative imports resolve. That is
   process-global, so concurrent requests can corrupt each other's working directory. The real
   fix is a package with a `pyproject.toml`.
-- `live/pairs_finder.py` runs a real cointegration test and nothing imports it, while
-  `pairs_config.py` describes its hand-picked pairs as "pre-validated". Wire one into the other
-  or delete it; the current state overclaims.
+- Stat Arb's pair universe defaults to hand-picked sector groupings until `pairs_finder.py` is
+  run. `GET /available-pairs/{ticker}` reports which universe is active, so this is visible
+  rather than implied, but the tested set is not checked in.
 
 Closed recently:
 
+- ~~`pairs_config.py` claimed its pairs were "pre-validated"~~ — they were hand-picked by
+  sector and never tested, while `pairs_finder.py` ran a real Engle-Granger cointegration test
+  that nothing imported. The two are now connected: `pairs_output.json` is the universe when it
+  exists, p-values travel with each pair, and the sector list is retained as a fallback that
+  says outright it is untested.
 - ~~A rejected pair leg could leave a naked position~~ — the two legs were submitted
   sequentially with no error handling, and the trade was recorded only after both succeeded, so
   a rejection on the second left an unhedged directional position that no row described. Legs

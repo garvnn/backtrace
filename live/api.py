@@ -18,7 +18,7 @@ from pydantic import BaseModel
 from database import Database
 
 logger = logging.getLogger(__name__)
-from pairs_config import get_available_pairs, is_valid_pair
+from pairs_config import get_available_pairs, get_pair_details, is_valid_pair, validated_pairs
 import json
 from datetime import datetime, timezone, timedelta, date
 import pandas as pd
@@ -242,9 +242,22 @@ def get_execution_logs(strategy: str = None, ticker: str = None, limit: int = 20
 
 @app.get("/available-pairs/{ticker}")
 def get_pairs_for_ticker(ticker: str):
-    """Get list of valid pairs for a ticker."""
-    pairs = get_available_pairs(ticker.upper())
-    return {"ticker": ticker.upper(), "available_pairs": pairs}
+    """
+    Valid pair options for a ticker, with the evidence behind them.
+
+    available_pairs keeps its original shape (a list of symbols) so existing
+    callers are unaffected. details carries the cointegration p-value for each,
+    and universe says whether these were tested at all or are the untested
+    sector fallback - the config used to claim "pre-validated" for pairs that
+    had never been tested.
+    """
+    sym = ticker.upper()
+    return {
+        "ticker": sym,
+        "available_pairs": get_available_pairs(sym),
+        "details": get_pair_details(sym),
+        "universe": validated_pairs(),
+    }
 
 
 @app.get("/pairs")
