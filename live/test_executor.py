@@ -3,6 +3,7 @@ Executor full test: all 10 SPY tickers, data fetch, signal generation, mocked tr
 Verifies database logging and error handling. Does NOT place real orders.
 """
 
+import json
 import os
 import sys
 import tempfile
@@ -451,6 +452,217 @@ def test_healthy_snapshot_written_normally():
             result = ex.log_portfolio_snapshot()
         assert result == "ok"
         assert len(db.get_portfolio_history()) == 1
+    finally:
+        os.path.exists(db_path) and os.remove(db_path)
+    return True
+
+
+# --- guarded pair execution ---------------------------------------------------
+
+def _asset(tradable=True, shortable=True, easy_to_borrow=True):
+    a = MagicMock()
+    a.tradable = tradable
+    a.shortable = shortable
+    a.easy_to_borrow = easy_to_borrow
+    return a
+
+
+def _pair_executor(db_path, client):
+    from strategies.stat_arb import StatArbStrategy
+    from database import Database
+    from executor import StrategyExecutor
+
+    db = Database(db_path)
+    db.get_last_executed_signal = MagicMock(return_value=None)
+    with patch.dict(os.environ, {"ALPACA_API_KEY": "x", "ALPACA_SECRET_KEY": "y"}, clear=False):
+        with patch("executor.TradingClient", return_value=client):
+            with patch("executor.Database", return_value=db):
+                ex = StrategyExecutor(
+                    StatArbStrategy(ticker_a="MCD", ticker_b="YUM"), ticker="MCD"
+                )
+    ex.trading_client = client
+    ex.db = db
+    return ex, db
+
+
+def _actions(db):
+    return [r["action"] if isinstance(r, dict) else r[5] for r in db.get_execution_logs()]
+
+
+def test_pair_legs_both_submitted_on_success():
+    from alpaca.trading.enums import OrderSide
+
+    client = MagicMock()
+    client.get_asset.return_value = _asset()
+    client.submit_order.side_effect = lambda req: MagicMock(id=f"ord-{req.symbol}")
+
+    fd, db_path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    try:
+        ex, db = _pair_executor(db_path, client)
+        a, b = ex._submit_pair_legs(
+            "MCD-YUM", ("MCD", 10, OrderSide.BUY), ("YUM", 12, OrderSide.SELL), tag="open-long"
+        )
+        assert a.id == "ord-MCD" and b.id == "ord-YUM"
+        assert client.submit_order.call_count == 2
+        # Both legs carry a client_order_id, and they differ.
+        ids = [c.args[0].client_order_id for c in client.submit_order.call_args_list]
+        assert all(ids) and len(set(ids)) == 2
+        assert "PAIR_INTENT" in _actions(db), "intent must be recorded before submitting"
+    finally:
+        os.path.exists(db_path) and os.remove(db_path)
+    return True
+
+
+def test_leg_a_is_unwound_when_leg_b_is_rejected():
+    """
+    The naked-position case. Leg B rejected after leg A went in must not leave
+    an unhedged directional position with no record of it.
+    """
+    from alpaca.trading.enums import OrderSide
+
+    client = MagicMock()
+    client.get_asset.return_value = _asset()
+    submitted = []
+
+    def _submit(req):
+        submitted.append((req.symbol, req.side))
+        if req.symbol == "YUM" and req.side == OrderSide.SELL:
+            raise RuntimeError("insufficient margin")
+        return MagicMock(id=f"ord-{req.symbol}")
+
+    client.submit_order.side_effect = _submit
+    client.cancel_order_by_id.side_effect = RuntimeError("already filled")
+
+    fd, db_path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    try:
+        ex, db = _pair_executor(db_path, client)
+        with unittest.TestCase().assertRaises(RuntimeError):
+            ex._submit_pair_legs(
+                "MCD-YUM", ("MCD", 10, OrderSide.BUY), ("YUM", 12, OrderSide.SELL),
+                tag="open-long",
+            )
+
+        # Leg A was flattened with the opposite side.
+        assert ("MCD", OrderSide.SELL) in submitted, f"leg A not unwound: {submitted}"
+        actions = _actions(db)
+        assert "PAIR_LEG_FAILED" in actions
+        row = [r for r in db.get_execution_logs()
+               if (r["action"] if isinstance(r, dict) else r[5]) == "PAIR_LEG_FAILED"][0]
+        details = row["details"] if isinstance(row, dict) else json.loads(row[7])
+        assert details["leg_a_flattened"] is True
+        assert details["naked_position_possible"] is False
+    finally:
+        os.path.exists(db_path) and os.remove(db_path)
+    return True
+
+
+def test_unfilled_leg_a_is_cancelled_rather_than_flattened():
+    """Cancelling an unfilled DAY order is cleaner than trading out of it."""
+    from alpaca.trading.enums import OrderSide
+
+    client = MagicMock()
+    client.get_asset.return_value = _asset()
+    client.submit_order.side_effect = lambda req: (
+        (_ for _ in ()).throw(RuntimeError("rejected")) if req.symbol == "YUM"
+        else MagicMock(id="ord-MCD")
+    )
+    client.cancel_order_by_id.return_value = None  # cancel succeeds
+
+    fd, db_path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    try:
+        ex, db = _pair_executor(db_path, client)
+        with unittest.TestCase().assertRaises(RuntimeError):
+            ex._submit_pair_legs(
+                "MCD-YUM", ("MCD", 10, OrderSide.BUY), ("YUM", 12, OrderSide.SELL),
+                tag="open-long",
+            )
+        client.cancel_order_by_id.assert_called_once()
+        row = [r for r in db.get_execution_logs()
+               if (r["action"] if isinstance(r, dict) else r[5]) == "PAIR_LEG_FAILED"][0]
+        details = row["details"] if isinstance(row, dict) else json.loads(row[7])
+        assert details["leg_a_cancelled"] is True
+        assert details["naked_position_possible"] is False
+    finally:
+        os.path.exists(db_path) and os.remove(db_path)
+    return True
+
+
+def test_unshortable_leg_blocks_the_whole_pair():
+    """Pre-check, so a rejection cannot arrive after the other leg is filled."""
+    from alpaca.trading.enums import OrderSide
+
+    client = MagicMock()
+    client.get_asset.side_effect = lambda t: _asset(shortable=(t != "YUM"))
+    client.submit_order.side_effect = AssertionError("must not submit")
+
+    fd, db_path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    try:
+        ex, db = _pair_executor(db_path, client)
+        with unittest.TestCase().assertRaises(RuntimeError):
+            ex._submit_pair_legs(
+                "MCD-YUM", ("MCD", 10, OrderSide.BUY), ("YUM", 12, OrderSide.SELL),
+                tag="open-long",
+            )
+        assert client.submit_order.call_count == 0, "no leg may be sent"
+        assert "NO_TRADE" in _actions(db)
+    finally:
+        os.path.exists(db_path) and os.remove(db_path)
+    return True
+
+
+def test_naked_position_is_flagged_when_unwind_also_fails():
+    """If nothing can be done, the record must say so as loudly as possible."""
+    from alpaca.trading.enums import OrderSide
+
+    client = MagicMock()
+    client.get_asset.return_value = _asset()
+
+    def _submit(req):
+        if req.symbol == "MCD" and req.side == OrderSide.BUY:
+            return MagicMock(id="ord-MCD")
+        raise RuntimeError("broker down")
+
+    client.submit_order.side_effect = _submit
+    client.cancel_order_by_id.side_effect = RuntimeError("already filled")
+
+    fd, db_path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    try:
+        ex, db = _pair_executor(db_path, client)
+        with unittest.TestCase().assertRaises(RuntimeError):
+            ex._submit_pair_legs(
+                "MCD-YUM", ("MCD", 10, OrderSide.BUY), ("YUM", 12, OrderSide.SELL),
+                tag="open-long",
+            )
+        row = [r for r in db.get_execution_logs()
+               if (r["action"] if isinstance(r, dict) else r[5]) == "PAIR_LEG_FAILED"][0]
+        details = row["details"] if isinstance(row, dict) else json.loads(row[7])
+        assert details["naked_position_possible"] is True
+    finally:
+        os.path.exists(db_path) and os.remove(db_path)
+    return True
+
+
+def test_unreadable_asset_record_does_not_block_trading():
+    """A metadata outage must not become a trading halt."""
+    from alpaca.trading.enums import OrderSide
+
+    client = MagicMock()
+    client.get_asset.side_effect = RuntimeError("503")
+    client.submit_order.side_effect = lambda req: MagicMock(id=f"ord-{req.symbol}")
+
+    fd, db_path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    try:
+        ex, db = _pair_executor(db_path, client)
+        a, b = ex._submit_pair_legs(
+            "MCD-YUM", ("MCD", 10, OrderSide.BUY), ("YUM", 12, OrderSide.SELL), tag="open-long"
+        )
+        assert a and b
     finally:
         os.path.exists(db_path) and os.remove(db_path)
     return True

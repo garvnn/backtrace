@@ -452,11 +452,19 @@ class StrategyExecutor:
         if want_flat and (in_long_spread or in_short_spread):
             # Close both legs
             if in_long_spread:
-                order_a = self.trading_client.submit_order(MarketOrderRequest(symbol=ticker_a, qty=abs(int(pos_a)), side=OrderSide.SELL, time_in_force=TimeInForce.DAY))
-                order_b = self.trading_client.submit_order(MarketOrderRequest(symbol=ticker_b, qty=abs(int(pos_b)), side=OrderSide.BUY, time_in_force=TimeInForce.DAY))
+                order_a, order_b = self._submit_pair_legs(
+                    pair_name,
+                    (ticker_a, abs(int(pos_a)), OrderSide.SELL),
+                    (ticker_b, abs(int(pos_b)), OrderSide.BUY),
+                    tag="close-long",
+                )
             else:
-                order_a = self.trading_client.submit_order(MarketOrderRequest(symbol=ticker_a, qty=abs(int(pos_a)), side=OrderSide.BUY, time_in_force=TimeInForce.DAY))
-                order_b = self.trading_client.submit_order(MarketOrderRequest(symbol=ticker_b, qty=abs(int(pos_b)), side=OrderSide.SELL, time_in_force=TimeInForce.DAY))
+                order_a, order_b = self._submit_pair_legs(
+                    pair_name,
+                    (ticker_a, abs(int(pos_a)), OrderSide.BUY),
+                    (ticker_b, abs(int(pos_b)), OrderSide.SELL),
+                    tag="close-short",
+                )
             spread_val = np.log(price_a) - beta * np.log(price_b)
             self.db.log_pair_trade(self.strategy.name, pair_name, ticker_a, ticker_b, 'SELL' if in_long_spread else 'BUY', 'BUY' if in_long_spread else 'SELL', abs(pos_a), abs(pos_b), spread_val, None, str(order_a.id), str(order_b.id))
             self._log_execution_event(
@@ -480,11 +488,21 @@ class StrategyExecutor:
             return None
         if want_long and not in_long_spread:
             if in_short_spread:
-                # Close short first
-                self.trading_client.submit_order(MarketOrderRequest(symbol=ticker_a, qty=abs(int(pos_a)), side=OrderSide.BUY, time_in_force=TimeInForce.DAY))
-                self.trading_client.submit_order(MarketOrderRequest(symbol=ticker_b, qty=abs(int(pos_b)), side=OrderSide.SELL, time_in_force=TimeInForce.DAY))
-            order_a = self.trading_client.submit_order(MarketOrderRequest(symbol=ticker_a, qty=qty_a, side=OrderSide.BUY, time_in_force=TimeInForce.DAY))
-            order_b = self.trading_client.submit_order(MarketOrderRequest(symbol=ticker_b, qty=qty_b, side=OrderSide.SELL, time_in_force=TimeInForce.DAY))
+                # Close the existing short spread before opening the long one.
+                # If this fails, do not proceed to open: that would stack a new
+                # spread on top of one still held.
+                self._submit_pair_legs(
+                    pair_name,
+                    (ticker_a, abs(int(pos_a)), OrderSide.BUY),
+                    (ticker_b, abs(int(pos_b)), OrderSide.SELL),
+                    tag="flip-close-short",
+                )
+            order_a, order_b = self._submit_pair_legs(
+                pair_name,
+                (ticker_a, qty_a, OrderSide.BUY),
+                (ticker_b, qty_b, OrderSide.SELL),
+                tag="open-long",
+            )
             spread_val = np.log(price_a) - beta * np.log(price_b)
             self.db.log_pair_trade(self.strategy.name, pair_name, ticker_a, ticker_b, 'BUY', 'SELL', qty_a, qty_b, spread_val, None, str(order_a.id), str(order_b.id))
             self._log_execution_event(
@@ -508,10 +526,18 @@ class StrategyExecutor:
             return None
         if want_short and not in_short_spread:
             if in_long_spread:
-                self.trading_client.submit_order(MarketOrderRequest(symbol=ticker_a, qty=abs(int(pos_a)), side=OrderSide.SELL, time_in_force=TimeInForce.DAY))
-                self.trading_client.submit_order(MarketOrderRequest(symbol=ticker_b, qty=abs(int(pos_b)), side=OrderSide.BUY, time_in_force=TimeInForce.DAY))
-            order_a = self.trading_client.submit_order(MarketOrderRequest(symbol=ticker_a, qty=qty_a, side=OrderSide.SELL, time_in_force=TimeInForce.DAY))
-            order_b = self.trading_client.submit_order(MarketOrderRequest(symbol=ticker_b, qty=qty_b, side=OrderSide.BUY, time_in_force=TimeInForce.DAY))
+                self._submit_pair_legs(
+                    pair_name,
+                    (ticker_a, abs(int(pos_a)), OrderSide.SELL),
+                    (ticker_b, abs(int(pos_b)), OrderSide.BUY),
+                    tag="flip-close-long",
+                )
+            order_a, order_b = self._submit_pair_legs(
+                pair_name,
+                (ticker_a, qty_a, OrderSide.SELL),
+                (ticker_b, qty_b, OrderSide.BUY),
+                tag="open-short",
+            )
             spread_val = np.log(price_a) - beta * np.log(price_b)
             self.db.log_pair_trade(self.strategy.name, pair_name, ticker_a, ticker_b, 'SELL', 'BUY', qty_a, qty_b, spread_val, None, str(order_a.id), str(order_b.id))
             self._log_execution_event(
@@ -788,13 +814,169 @@ class StrategyExecutor:
         print(f"Latest signal: {current_signal}")
         self.execute_signal(current_signal, data)
 
-    # Note on the pair path below: its submit_order calls are deliberately NOT
-    # wrapped in with_retry. Retrying a submission is only safe because every
-    # single-name order carries a deterministic client_order_id that Alpaca will
-    # reject on a duplicate. The pair legs pass no client_order_id, so a retry
-    # after a timeout - where the first request may well have succeeded - could
-    # open a second leg and leave the spread unbalanced. Retries here wait on
-    # the guarded pair execution the README lists as an open gap.
+    def _pair_leg_order_id(self, pair_name, ticker, side, tag):
+        """
+        Deterministic id for one leg, so a retried submit cannot double it.
+
+        Includes the leg's role (tag) because a single state flip submits up to
+        four orders on the same pair, same day - closing one spread and opening
+        the other - and they must not collide with each other.
+        """
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
+        slug = self.strategy.name.replace(" ", "")
+        return f"{slug}-{pair_name}-{stamp}-{tag}-{ticker}-{side}"
+
+    def _assert_tradable(self, ticker, side):
+        """
+        Refuse a leg the broker will reject anyway.
+
+        A short leg needs the asset to be shortable and borrowable. Finding
+        that out from a rejection after the long leg is already filled is how
+        a naked position happens; asking first costs one request.
+
+        An unreadable asset record does not block the trade - that would make
+        a metadata outage a trading halt - but it is logged.
+        """
+        try:
+            asset = with_retry(
+                lambda: self.trading_client.get_asset(ticker),
+                description=f"get_asset({ticker})",
+            )
+        except Exception as e:
+            print(f"Could not verify {ticker} tradability ({e}); proceeding")
+            return True, None
+
+        if not getattr(asset, "tradable", True):
+            return False, f"{ticker} is not tradable"
+        if side == OrderSide.SELL:
+            if not getattr(asset, "shortable", True):
+                return False, f"{ticker} is not shortable"
+            if not getattr(asset, "easy_to_borrow", True):
+                print(f"Warning: {ticker} is shortable but not easy to borrow")
+        return True, None
+
+    def _submit_pair_legs(self, pair_name, leg_a, leg_b, tag):
+        """
+        Submit both legs of a spread, or neither.
+
+        Each leg is (ticker, qty, side). Returns (order_a, order_b).
+
+        The problem this exists for: the two legs were submitted sequentially
+        with no error handling, and log_pair_trade ran only after both
+        succeeded. If leg B was rejected - not shortable, hard to borrow,
+        insufficient margin, a 429, a transient 5xx - the exception propagated
+        to the scheduler's blanket except, got logged as "Failed TICKER", and
+        the loop moved on. The account was then holding an unhedged directional
+        position that no database row recorded. A pair strategy carrying one
+        leg is not a hedged trade with a problem; it is a naked bet nobody
+        chose to make.
+
+        So: pre-check both legs, record the intent before submitting anything,
+        and if leg B fails after leg A filled, unwind leg A immediately rather
+        than leaving it. The unwind is best-effort - if it also fails there is
+        nothing further this process can do, and the loudest possible record is
+        the remaining useful act.
+        """
+        ticker_a, qty_a, side_a = leg_a
+        ticker_b, qty_b, side_b = leg_b
+
+        for ticker, side in ((ticker_a, side_a), (ticker_b, side_b)):
+            ok, why = self._assert_tradable(ticker, side)
+            if not ok:
+                self._log_execution_event(
+                    ticker=pair_name, signal="N/A", action="NO_TRADE",
+                    reason="leg_not_tradable", details={"detail": why, "tag": tag},
+                )
+                raise RuntimeError(f"Pair {pair_name} not executable: {why}")
+
+        # Intent first. If the process dies between the two submits, this row is
+        # what tells the next run that a leg may be outstanding.
+        self._log_execution_event(
+            ticker=pair_name, signal="N/A", action="PAIR_INTENT", reason=tag,
+            details={
+                "ticker_a": ticker_a, "qty_a": qty_a, "side_a": side_a.value,
+                "ticker_b": ticker_b, "qty_b": qty_b, "side_b": side_b.value,
+            },
+        )
+
+        order_a = with_retry(
+            lambda: self.trading_client.submit_order(MarketOrderRequest(
+                symbol=ticker_a, qty=qty_a, side=side_a,
+                time_in_force=TimeInForce.DAY,
+                client_order_id=self._pair_leg_order_id(pair_name, ticker_a, side_a.value, tag),
+            )),
+            description=f"submit_order({side_a.value} {ticker_a}) leg A of {pair_name}",
+        )
+
+        try:
+            order_b = with_retry(
+                lambda: self.trading_client.submit_order(MarketOrderRequest(
+                    symbol=ticker_b, qty=qty_b, side=side_b,
+                    time_in_force=TimeInForce.DAY,
+                    client_order_id=self._pair_leg_order_id(pair_name, ticker_b, side_b.value, tag),
+                )),
+                description=f"submit_order({side_b.value} {ticker_b}) leg B of {pair_name}",
+            )
+        except Exception as leg_b_error:
+            self._unwind_leg(pair_name, ticker_a, qty_a, side_a, order_a, tag, leg_b_error)
+            raise
+
+        return order_a, order_b
+
+    def _unwind_leg(self, pair_name, ticker, qty, side, order, tag, cause):
+        """
+        Undo a leg whose partner could not be placed. Best effort, loudly logged.
+
+        Cancel first: if leg A has not filled yet - likely, since these are DAY
+        orders submitted after the close - cancelling is clean and costs
+        nothing. If it has filled, submit the opposite side to flatten.
+        """
+        print(f"LEG B FAILED on {pair_name} ({cause}); unwinding leg A ({side.value} {qty} {ticker})")
+        opposite = OrderSide.BUY if side == OrderSide.SELL else OrderSide.SELL
+        cancelled = False
+        unwound = False
+        unwind_error = None
+
+        try:
+            self.trading_client.cancel_order_by_id(order.id)
+            cancelled = True
+        except Exception as e:
+            cancelled = False
+            print(f"Could not cancel leg A ({e}); will try to flatten instead")
+
+        if not cancelled:
+            try:
+                with_retry(
+                    lambda: self.trading_client.submit_order(MarketOrderRequest(
+                        symbol=ticker, qty=qty, side=opposite,
+                        time_in_force=TimeInForce.DAY,
+                        client_order_id=self._pair_leg_order_id(
+                            pair_name, ticker, opposite.value, f"{tag}-unwind"
+                        ),
+                    )),
+                    description=f"unwind {opposite.value} {ticker}",
+                )
+                unwound = True
+            except Exception as e:
+                unwind_error = str(e)
+                print(f"UNWIND FAILED for {ticker}: {e}. POSITION MAY BE NAKED - intervene manually.")
+
+        self._log_execution_event(
+            ticker=pair_name, signal="N/A", action="PAIR_LEG_FAILED",
+            reason="leg_b_rejected",
+            details={
+                "tag": tag,
+                "leg_a_ticker": ticker,
+                "leg_a_qty": qty,
+                "leg_a_side": side.value,
+                "leg_a_order_id": str(getattr(order, "id", None)),
+                "cause": str(cause),
+                "leg_a_cancelled": cancelled,
+                "leg_a_flattened": unwound,
+                "unwind_error": unwind_error,
+                "naked_position_possible": not (cancelled or unwound),
+            },
+        )
 
     def _run_pair(self):
         """Pair flow (Stat Arb): fetch both, generate signals, execute both legs."""

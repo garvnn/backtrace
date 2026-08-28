@@ -87,10 +87,6 @@ Tracked honestly rather than described as working.
 
 Open:
 
-- Stat Arb pair execution submits its two legs sequentially with no compensating action if the
-  second is rejected, and its legs carry no `client_order_id`, so unlike every other order they
-  cannot safely be retried. It is not run live, which is why this is not urgent — but it is the
-  one remaining place an order can go wrong quietly.
 - `live/api.py` calls `os.chdir()` in five endpoints so relative imports resolve. That is
   process-global, so concurrent requests can corrupt each other's working directory. The real
   fix is a package with a `pyproject.toml`.
@@ -100,6 +96,13 @@ Open:
 
 Closed recently:
 
+- ~~A rejected pair leg could leave a naked position~~ — the two legs were submitted
+  sequentially with no error handling, and the trade was recorded only after both succeeded, so
+  a rejection on the second left an unhedged directional position that no row described. Legs
+  are now pre-checked for tradability and shortability, the intent is written before anything is
+  submitted, and a failure on the second leg cancels the first (or flattens it if already
+  filled). If even the unwind fails, the log says `naked_position_possible` rather than going
+  quiet. Legs also carry `client_order_id` now, which is what makes retrying them safe.
 - ~~Live and backtest sized positions separately~~ — one `SizingPolicy` in `trading/sizing.py`
   now serves both, and a parity test asserts they return identical share counts across a
   capital × price grid. The executor reads `account.cash` for single names and `account.equity`
