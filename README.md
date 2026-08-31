@@ -38,18 +38,30 @@ Paper trading has run unattended on Railway since March 2026. As of **2026-08-25
 
 | | |
 |---|---|
-| Trading days | 115 (2026-03-17 → 2026-08-25, no gaps) |
-| Account snapshots | 1,144 |
+| Trading days | 118 (2026-03-17 → 2026-08-28, no gaps) |
+| Account snapshots | 1,174 (1 excluded, see below) |
 | Orders submitted | 45 |
 | Universe | 10 largest SPY holdings |
 | Strategy | Momentum (120-day lookback), long/flat |
-| Live return | **+1.68%** (103,621.03 → 105,366.19) |
+| Live return | **+2.75%** (103,652.54 → 106,501.42) |
+| Max drawdown | **−7.04%** (2026-05-14 → 2026-06-25) |
 
 The return is measured from the **first snapshot**, not from the configured $100,000 starting
 capital. Those differ — the account had already drifted before the first snapshot was written —
-and measuring against the configured number instead reported +5.37%, which is a real
-+1.68% plus $3,621 of history that predates the record. `/performance` and `/live-benchmark`
-now agree to eight decimal places because both measure the same window.
+so measuring against the configured number credits the strategy with $3,652 of history that
+predates the record. `/performance` and `/live-benchmark` now agree because both measure the
+same window.
+
+The drawdown figure is the one worth explaining. Measured over the raw snapshots it reads
+−61.24%, and that number is an artifact of a single defective row on 2026-07-07 (see Known
+gaps). With that row excluded the real figure is −7.04%, which is what a long/flat momentum
+strategy on ten large-cap names actually did over six weeks. Reproduce either with:
+
+```bash
+python3 scripts/diagnose_drawdown.py --url <your-api-url>
+```
+
+which prints both, names the excluded row, and does not delete it.
 
 ### The divergence figure
 
@@ -141,7 +153,8 @@ Closed recently:
   curve. Snapshots are now reconciled against the marked value of what is held before being
   persisted, with one retry for the transient case; readings that do not add up are refused and
   logged rather than recorded. Historical rows are excluded from metrics by shape rather than
-  deleted, and `/live-benchmark` reports how many it dropped.
+  deleted, and `/live-benchmark` reports how many it dropped. Measured on production: 1 row of
+  1,174, and the reported max drawdown goes from −61.24% to −7.04%.
 - ~~Per-ticker strategy selection~~ — advertised but never functioned: it fit on 42 training
   rows while the strategies need 120 and 200, so both scored exactly 0.00 and Momentum won the
   tie every time, for every ticker, across all 115 days. Removed rather than papered over.
