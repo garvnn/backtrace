@@ -28,25 +28,38 @@ def pytest_configure(config):
 
 
 @pytest.fixture(scope="session")
-def db():
+def db_path():
     """
-    Database connected to DB_PATH (test DB written by executor).
+    Resolved path to the test database.
+
     Fails fast if DB_PATH is unset or points at production without override.
+    Schema tests open this with sqlite3 directly rather than through Database,
+    so they need the path, not a connection.
     """
-    db_path = os.environ.get("DB_PATH")
-    if not db_path:
+    path = os.environ.get("DB_PATH")
+    if not path:
         pytest.fail(
             "DB_PATH is not set. Export a non-production test database path, e.g.\n"
             "  export DB_PATH=/tmp/backtrace_invariant_test.db"
         )
 
-    db_path = os.path.abspath(db_path)
-    if db_path == os.path.abspath(PRODUCTION_DB) and os.environ.get("INVARIANT_ALLOW_PRODUCTION") != "1":
+    path = os.path.abspath(path)
+    if path == os.path.abspath(PRODUCTION_DB) and os.environ.get("INVARIANT_ALLOW_PRODUCTION") != "1":
         pytest.fail(
             f"DB_PATH points to production database ({PRODUCTION_DB}). "
             "Set INVARIANT_ALLOW_PRODUCTION=1 to override."
         )
 
+    # Applies the schema and its migrations. Without this, a test pointed at a
+    # path that does not exist yet gets an empty file from sqlite3.connect and
+    # the schema assertions fail on a database that was simply never created.
+    Database(path)
+    return path
+
+
+@pytest.fixture(scope="session")
+def db(db_path):
+    """Database connected to DB_PATH (test DB written by executor)."""
     return Database(db_path)
 
 

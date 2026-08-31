@@ -4,6 +4,7 @@ Strategy executor - runs BackTrace strategies live.
 
 import os
 import sys
+import time
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 
@@ -12,29 +13,69 @@ from alpaca.trading.client import TradingClient
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
-from alpaca.data.enums import Adjustment
+from alpaca.data.enums import Adjustment, DataFeed
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import numpy as np
 import pandas as pd
 
 from strategies.momentum import MomentumStrategy
-from strategies.mean_reversion import MeanReversionStrategy
+from strategies.ma_crossover import MACrossoverStrategy
 from strategies.stat_arb import StatArbStrategy
 
 from database import Database
-from trading_constants import (
-    MAX_DOLLAR_PER_STOCK,
-    BUYING_POWER_FRACTION,
-    PAIR_CAPITAL_FRACTION,
+from snapshot_health import (
+    EMPTY_POSITIONS_VALUE_IS_CASH,
+    SNAPSHOT_RETRY_DELAY_SECONDS,
+    reconcile_snapshot,
 )
+from alpaca_retry import with_retry
+from trading.sizing import SessionBudget, SizingPolicy, default_policy
+from trading_constants import ALPACA_DATA_FEED, PAIR_CAPITAL_FRACTION
+
+
+def _resolve_feed():
+    """
+    Which market-data feed to request, explicitly.
+
+    Left unset, the server picks - IEX on the free plan. Since this project
+    measures Alpaca-vs-Yahoo close divergence, the feed is a variable in the
+    measurement, not an implementation detail to inherit silently.
+    """
+    name = (os.getenv("ALPACA_DATA_FEED") or ALPACA_DATA_FEED or "iex").strip().lower()
+    try:
+        return DataFeed(name)
+    except ValueError:
+        print(f"Unknown ALPACA_DATA_FEED {name!r}; falling back to IEX")
+        return DataFeed.IEX
 
 # Load .env from live/ so it works when run as "python live/executor.py" from project root
 LIVE_DIR = os.path.dirname(os.path.abspath(__file__))
 _env_path = os.path.join(LIVE_DIR, ".env")
 load_dotenv(_env_path)
 DB_PATH = os.getenv("DB_PATH") or os.path.join(LIVE_DIR, "trading.db")
+
+def _to_float(value):
+    """Float or None. Alpaca returns these as strings, and as None before a fill."""
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _order_status(order):
+    """
+    Alpaca order status as its wire value, e.g. "accepted".
+
+    str(order.status) yields the Python enum repr "OrderStatus.ACCEPTED", which
+    previously leaked all the way into the database and then into the browser,
+    where the frontend stripped the "OrderStatus." prefix back off.
+    """
+    return getattr(order.status, "value", str(order.status))
+
 
 def _bars_to_backtrace_df(df_one):
     """Convert Alpaca bars DataFrame (single symbol) to BackTrace format: Date index, Open/High/Low/Close/Volume."""
@@ -48,39 +89,17 @@ def _bars_to_backtrace_df(df_one):
     return df
 
 
-class SessionBudget:
-    """
-    Tracks cumulative dollars available for new BUYs across a batch of tickers
-    processed in a single scheduler run (see scheduler.py run_daily_strategy).
-
-    Without this, each ticker's buy is capped only against MAX_DOLLAR_PER_STOCK
-    and the account's buying_power — and buying_power on a margin account can
-    be several times actual cash. A batch of independently-capped buys can
-    then collectively deploy more real cash than the account holds, drawing
-    on margin with no one buy ever looking oversized. This ties all buys in
-    one run to a single shared, cash-based ceiling.
-
-    Only wired into the single-ticker path (execute_signal); pair execution
-    (Stat Arb) is not run in a batch loop today, so it doesn't need this.
-    """
-
-    def __init__(self, total):
-        self.remaining = max(0.0, float(total))
-
-    def reserve(self, amount):
-        """Deduct up to `amount` from the remaining budget. Returns the amount actually deducted."""
-        amount = max(0.0, float(amount))
-        granted = min(amount, self.remaining)
-        self.remaining -= granted
-        return granted
-
-
 class StrategyExecutor:
-    def __init__(self, strategy, ticker='AAPL', params=None, session_budget=None):
+    def __init__(self, strategy, ticker='AAPL', params=None, session_budget=None,
+                 sizing=None):
         self.strategy = strategy
         self.ticker = ticker
         self.params = params  # optional dict e.g. short_window, long_window, lookback_period for logging
         self.session_budget = session_budget  # optional SessionBudget shared across a batch run
+        # The same policy BacktestEngine sizes with, so a given (capital,
+        # price) pair produces the same share count on both sides. Overridable
+        # for tests; see trading/sizing.py for why this is shared at all.
+        self.sizing = sizing if sizing is not None else default_policy()
         api_key = os.getenv('ALPACA_API_KEY')
         secret_key = os.getenv('ALPACA_SECRET_KEY')
         if not api_key or not secret_key:
@@ -103,10 +122,20 @@ class StrategyExecutor:
         request = StockBarsRequest(
             symbol_or_symbols=syms,
             timeframe=TimeFrame.Day,
-            start=datetime.now() - timedelta(days=days),
+            # UTC, not host-local. datetime.now() without a tz asks for a
+            # window whose meaning depends on where the process runs - this
+            # trades a New York market from UTC containers, and was developed
+            # on a laptop in Eastern. StockBarsRequest strips the tzinfo when
+            # it normalises, so req.start reads naive afterwards; the value it
+            # keeps is the UTC one.
+            start=datetime.now(timezone.utc) - timedelta(days=days),
             adjustment=Adjustment.ALL,
+            feed=_resolve_feed(),
         )
-        bars = self.data_client.get_stock_bars(request)
+        bars = with_retry(
+            lambda: self.data_client.get_stock_bars(request),
+            description=f"get_stock_bars({','.join(syms)})",
+        )
         df = getattr(bars, 'df', pd.DataFrame())
         if df.empty:
             return (pd.DataFrame(), pd.DataFrame()) if len(syms) == 2 else pd.DataFrame()
@@ -159,16 +188,25 @@ class StrategyExecutor:
         return df_a.loc[common].sort_index(), df_b.loc[common].sort_index()
 
     def get_current_position(self, symbol=None):
-        """Check position for a symbol (default self.ticker). Returns signed qty."""
+        """
+        Signed quantity held for a symbol (default self.ticker). 0 means flat.
+
+        Fails closed: if Alpaca cannot be reached, this raises rather than
+        returning 0. It previously swallowed every exception and reported "flat",
+        which meant a 429, an expired key, or a transient 5xx looked identical to
+        holding nothing - and execute_signal treats "flat" as permission to buy.
+        A single failed position read could therefore open a second position on
+        top of an existing one. Callers (the scheduler's per-ticker try/except)
+        skip the ticker instead, which is the safe outcome.
+        """
         sym = symbol if symbol is not None else self.ticker
-        try:
-            positions = self.trading_client.get_all_positions()
-            for pos in positions:
-                if pos.symbol == sym:
-                    return float(pos.qty)
-            return 0
-        except Exception:
-            return 0
+        positions = with_retry(
+            self.trading_client.get_all_positions, description="get_all_positions"
+        )
+        for pos in positions:
+            if pos.symbol == sym:
+                return float(pos.qty)
+        return 0
 
     def _serialize_signal(self, signal):
         """Normalize signal value to stable string."""
@@ -189,10 +227,20 @@ class StrategyExecutor:
         )
     
     def execute_signal(self, signal, data):
-        """Place order based on signal. Only acts on signal change (idempotent); caps BUY at MAX_DOLLAR_PER_STOCK."""
+        """
+        Place an order when the signal changes. Idempotent on signal state.
+
+        Sizing goes through self.sizing, the same SizingPolicy the backtest
+        uses, against account cash rather than buying_power - see
+        trading/sizing.py.
+        """
         current_position = self.get_current_position()
-        account = self.trading_client.get_account()
-        buying_power = float(account.buying_power)
+        account = with_retry(self.trading_client.get_account, description="get_account")
+        # Cash, not buying_power. buying_power on a margin paper account is
+        # roughly 2x equity, and sizing against it is what drove production
+        # cash to -$6,830.22 on 2026-07-10 while the backtest, sizing off cash,
+        # modelled nothing of the sort. See trading/sizing.py.
+        available_capital = float(account.cash)
         last_signal = self.db.get_last_executed_signal(self.strategy.name, self.ticker)
         
         print(f"\nCurrent position: {current_position} shares")
@@ -201,23 +249,26 @@ class StrategyExecutor:
         
         # Signal = 1 (buy), 0 (sell/flat). Only place order when signal changed from last executed.
         if signal == 1 and current_position == 0 and last_signal != 1:
-            # Buy: cap at MAX_DOLLAR_PER_STOCK per stock, and at whatever's left of the
-            # shared session budget (if any) so a multi-ticker batch can't collectively
-            # spend more real cash than the account holds — see SessionBudget.
-            dollar_amount = min(MAX_DOLLAR_PER_STOCK, buying_power * BUYING_POWER_FRACTION)
+            # Same policy object the backtest sizes with, so an identical
+            # (capital, price) pair yields an identical share count on both
+            # sides. That parity is asserted in live/test_sizing.py.
             session_budget_remaining = self.session_budget.remaining if self.session_budget is not None else None
-            if session_budget_remaining is not None:
-                dollar_amount = min(dollar_amount, session_budget_remaining)
-            qty = int(dollar_amount / current_price)
+            dollar_amount = self.sizing.notional(available_capital, session_budget_remaining)
+            qty = self.sizing.shares(available_capital, current_price, session_budget_remaining)
 
             if qty > 0:
+                fill_model = self._fill_model()
                 order_data = MarketOrderRequest(
                     symbol=self.ticker,
                     qty=qty,
                     side=OrderSide.BUY,
-                    time_in_force=TimeInForce.DAY
+                    time_in_force=TimeInForce.DAY,
+                    client_order_id=self._client_order_id('BUY'),
                 )
-                order = self.trading_client.submit_order(order_data)
+                order = with_retry(
+                    lambda: self.trading_client.submit_order(order_data),
+                    description=f"submit_order(BUY {self.ticker})",
+                )
                 print(f"BUY order placed: {qty} shares")
                 if self.session_budget is not None:
                     self.session_budget.reserve(qty * current_price)
@@ -230,8 +281,10 @@ class StrategyExecutor:
                     qty=qty,
                     price=current_price,
                     order_id=str(order.id),
-                    status=str(order.status),
+                    status=_order_status(order),
                     params=self.params,
+                    client_order_id=getattr(order, 'client_order_id', None),
+                    fill_model=fill_model,
                 )
                 self._log_execution_event(
                     ticker=self.ticker,
@@ -241,10 +294,10 @@ class StrategyExecutor:
                     details={
                         "current_position": current_position,
                         "last_executed_signal": last_signal,
-                        "buying_power": buying_power,
+                        "available_capital": available_capital,
                         "price": current_price,
                         "qty": qty,
-                        "max_dollar_per_stock": MAX_DOLLAR_PER_STOCK,
+                        "max_dollar_per_stock": self.sizing.max_notional_per_symbol,
                         "session_budget_remaining_before": session_budget_remaining,
                         "params": self.params,
                     },
@@ -259,10 +312,10 @@ class StrategyExecutor:
                 details={
                     "current_position": current_position,
                     "last_executed_signal": last_signal,
-                    "buying_power": buying_power,
+                    "available_capital": available_capital,
                     "price": current_price,
                     "computed_qty": qty,
-                    "max_dollar_per_stock": MAX_DOLLAR_PER_STOCK,
+                    "max_dollar_per_stock": self.sizing.max_notional_per_symbol,
                     "session_budget_remaining": session_budget_remaining,
                     "params": self.params,
                 },
@@ -270,24 +323,35 @@ class StrategyExecutor:
         
         elif signal == 0 and current_position > 0 and last_signal != 0:
             # Sell all
+            fill_model = self._fill_model()
             order_data = MarketOrderRequest(
                 symbol=self.ticker,
                 qty=current_position,
                 side=OrderSide.SELL,
-                time_in_force=TimeInForce.DAY
+                time_in_force=TimeInForce.DAY,
+                client_order_id=self._client_order_id('SELL'),
             )
-            order = self.trading_client.submit_order(order_data)
+            order = with_retry(
+                lambda: self.trading_client.submit_order(order_data),
+                description=f"submit_order(SELL {self.ticker})",
+            )
             print(f"SELL order placed: {current_position} shares")
-            
-            # Log to database
+
+            # Log to database. price is the decision-time close, not the fill:
+            # a DAY market order placed after the close fills at the next open.
+            # Without it, exits had no price at all and no round trip in the
+            # trade log was computable.
             self.db.log_trade(
                 strategy=self.strategy.name,
                 ticker=self.ticker,
                 side='SELL',
                 qty=current_position,
+                price=current_price,
                 order_id=str(order.id),
-                status=str(order.status),
+                status=_order_status(order),
                 params=self.params,
+                client_order_id=getattr(order, 'client_order_id', None),
+                fill_model=fill_model,
             )
             self._log_execution_event(
                 ticker=self.ticker,
@@ -325,7 +389,7 @@ class StrategyExecutor:
                 details={
                     "current_position": current_position,
                     "last_executed_signal": last_signal,
-                    "buying_power": buying_power,
+                    "available_capital": available_capital,
                     "price": current_price,
                     "params": self.params,
                 },
@@ -341,10 +405,13 @@ class StrategyExecutor:
         pos_b = self.get_current_position(ticker_b)
         price_a = float(data_a['Close'].iloc[-1])
         price_b = float(data_b['Close'].iloc[-1])
-        account = self.trading_client.get_account()
-        buying_power = float(account.buying_power)
-        # Use half of allocated capital for the pair (equal dollar legs)
-        capital = buying_power * PAIR_CAPITAL_FRACTION
+        account = with_retry(self.trading_client.get_account, description="get_account")
+        # Equity, not buying_power. The backtest sizes a spread leg off equity
+        # (equity * capital_fraction * pair_fraction); reading buying_power
+        # here made the live pair path run about 2x the backtest's leverage,
+        # unmeasured, in the one place the project can least afford it.
+        available_capital = float(account.equity)
+        capital = self.sizing.pair_notional(available_capital, PAIR_CAPITAL_FRACTION)
         lookback = getattr(self.strategy, 'lookback', 60)
         if len(data_a) >= lookback and len(data_b) >= lookback:
             pa = data_a['Close'].iloc[-lookback:].values.astype(float)
@@ -370,7 +437,7 @@ class StrategyExecutor:
                     "price_a": price_a,
                     "price_b": price_b,
                     "beta": beta,
-                    "buying_power": buying_power,
+                    "available_capital": available_capital,
                     "params": self.params,
                 },
             )
@@ -385,11 +452,19 @@ class StrategyExecutor:
         if want_flat and (in_long_spread or in_short_spread):
             # Close both legs
             if in_long_spread:
-                order_a = self.trading_client.submit_order(MarketOrderRequest(symbol=ticker_a, qty=abs(int(pos_a)), side=OrderSide.SELL, time_in_force=TimeInForce.DAY))
-                order_b = self.trading_client.submit_order(MarketOrderRequest(symbol=ticker_b, qty=abs(int(pos_b)), side=OrderSide.BUY, time_in_force=TimeInForce.DAY))
+                order_a, order_b = self._submit_pair_legs(
+                    pair_name,
+                    (ticker_a, abs(int(pos_a)), OrderSide.SELL),
+                    (ticker_b, abs(int(pos_b)), OrderSide.BUY),
+                    tag="close-long",
+                )
             else:
-                order_a = self.trading_client.submit_order(MarketOrderRequest(symbol=ticker_a, qty=abs(int(pos_a)), side=OrderSide.BUY, time_in_force=TimeInForce.DAY))
-                order_b = self.trading_client.submit_order(MarketOrderRequest(symbol=ticker_b, qty=abs(int(pos_b)), side=OrderSide.SELL, time_in_force=TimeInForce.DAY))
+                order_a, order_b = self._submit_pair_legs(
+                    pair_name,
+                    (ticker_a, abs(int(pos_a)), OrderSide.BUY),
+                    (ticker_b, abs(int(pos_b)), OrderSide.SELL),
+                    tag="close-short",
+                )
             spread_val = np.log(price_a) - beta * np.log(price_b)
             self.db.log_pair_trade(self.strategy.name, pair_name, ticker_a, ticker_b, 'SELL' if in_long_spread else 'BUY', 'BUY' if in_long_spread else 'SELL', abs(pos_a), abs(pos_b), spread_val, None, str(order_a.id), str(order_b.id))
             self._log_execution_event(
@@ -413,11 +488,21 @@ class StrategyExecutor:
             return None
         if want_long and not in_long_spread:
             if in_short_spread:
-                # Close short first
-                self.trading_client.submit_order(MarketOrderRequest(symbol=ticker_a, qty=abs(int(pos_a)), side=OrderSide.BUY, time_in_force=TimeInForce.DAY))
-                self.trading_client.submit_order(MarketOrderRequest(symbol=ticker_b, qty=abs(int(pos_b)), side=OrderSide.SELL, time_in_force=TimeInForce.DAY))
-            order_a = self.trading_client.submit_order(MarketOrderRequest(symbol=ticker_a, qty=qty_a, side=OrderSide.BUY, time_in_force=TimeInForce.DAY))
-            order_b = self.trading_client.submit_order(MarketOrderRequest(symbol=ticker_b, qty=qty_b, side=OrderSide.SELL, time_in_force=TimeInForce.DAY))
+                # Close the existing short spread before opening the long one.
+                # If this fails, do not proceed to open: that would stack a new
+                # spread on top of one still held.
+                self._submit_pair_legs(
+                    pair_name,
+                    (ticker_a, abs(int(pos_a)), OrderSide.BUY),
+                    (ticker_b, abs(int(pos_b)), OrderSide.SELL),
+                    tag="flip-close-short",
+                )
+            order_a, order_b = self._submit_pair_legs(
+                pair_name,
+                (ticker_a, qty_a, OrderSide.BUY),
+                (ticker_b, qty_b, OrderSide.SELL),
+                tag="open-long",
+            )
             spread_val = np.log(price_a) - beta * np.log(price_b)
             self.db.log_pair_trade(self.strategy.name, pair_name, ticker_a, ticker_b, 'BUY', 'SELL', qty_a, qty_b, spread_val, None, str(order_a.id), str(order_b.id))
             self._log_execution_event(
@@ -441,10 +526,18 @@ class StrategyExecutor:
             return None
         if want_short and not in_short_spread:
             if in_long_spread:
-                self.trading_client.submit_order(MarketOrderRequest(symbol=ticker_a, qty=abs(int(pos_a)), side=OrderSide.SELL, time_in_force=TimeInForce.DAY))
-                self.trading_client.submit_order(MarketOrderRequest(symbol=ticker_b, qty=abs(int(pos_b)), side=OrderSide.BUY, time_in_force=TimeInForce.DAY))
-            order_a = self.trading_client.submit_order(MarketOrderRequest(symbol=ticker_a, qty=qty_a, side=OrderSide.SELL, time_in_force=TimeInForce.DAY))
-            order_b = self.trading_client.submit_order(MarketOrderRequest(symbol=ticker_b, qty=qty_b, side=OrderSide.BUY, time_in_force=TimeInForce.DAY))
+                self._submit_pair_legs(
+                    pair_name,
+                    (ticker_a, abs(int(pos_a)), OrderSide.SELL),
+                    (ticker_b, abs(int(pos_b)), OrderSide.BUY),
+                    tag="flip-close-long",
+                )
+            order_a, order_b = self._submit_pair_legs(
+                pair_name,
+                (ticker_a, qty_a, OrderSide.SELL),
+                (ticker_b, qty_b, OrderSide.BUY),
+                tag="open-short",
+            )
             spread_val = np.log(price_a) - beta * np.log(price_b)
             self.db.log_pair_trade(self.strategy.name, pair_name, ticker_a, ticker_b, 'SELL', 'BUY', qty_a, qty_b, spread_val, None, str(order_a.id), str(order_b.id))
             self._log_execution_event(
@@ -498,22 +591,207 @@ class StrategyExecutor:
         )
         return None
     
+    def _fill_model(self):
+        """
+        Which fill model this order will follow: the market's state decides it.
+
+        The backtest fills at Open[T+1] from a Close[T] signal. The 16:30 ET
+        scheduler matches that, because a DAY market order submitted after the
+        close queues to the next open. A manual run during market hours does
+        not: it signals off an incomplete daily bar and fills in the same
+        session, which the backtest cannot reproduce under any of its models.
+
+        Recording which case applied is what lets
+        analytics.divergence.estimate_execution_timing_impact be applied to the
+        right subset of trades instead of to all of them indiscriminately.
+        Returns None if the clock cannot be read - unknown, not assumed.
+        """
+        try:
+            return "immediate_intraday" if self.trading_client.get_clock().is_open else "queued_next_open"
+        except Exception as e:
+            print(f"Could not read market clock; fill_model unknown: {e}")
+            return None
+
+    def _client_order_id(self, side):
+        """
+        Deterministic per (strategy, ticker, date, side) so the broker rejects a
+        duplicate submission.
+
+        The existing get_last_executed_signal check is self-enforced and fails
+        open: if the DB write succeeded but the process died, or two runs overlap,
+        nothing stops a second identical order. Alpaca rejecting a repeated
+        client_order_id is enforced on the broker's side, which is the only place
+        it can be enforced reliably.
+        """
+        stamp = datetime.now().strftime("%Y%m%d")
+        slug = self.strategy.name.replace(" ", "-")
+        return f"{slug}-{self.ticker}-{stamp}-{side}"
+
+    def reconcile_open_orders(self, max_age_days=10):
+        """
+        Settle previously submitted orders against what Alpaca actually did.
+
+        Called at the START of a run, not after submitting: a DAY market order
+        placed at 16:30 does not fill until the next open ~17 hours later, so
+        there is nothing to poll at submit time. Each run therefore settles the
+        previous run's orders. This is what turns the trade log from a record of
+        intentions into a record of fills, and it is the prerequisite for any
+        per-trade slippage or P&L number.
+
+        Returns a list of the changes applied.
+        """
+        open_orders = self.db.get_unreconciled_orders(max_age_days=max_age_days)
+        if not open_orders:
+            return []
+
+        changes = []
+        for row in open_orders:
+            try:
+                order = with_retry(
+                    lambda: self.trading_client.get_order_by_id(row["order_id"]),
+                    description=f"get_order_by_id({row['order_id']})",
+                )
+            except Exception as e:
+                print(f"Could not fetch order {row['order_id']} for {row['ticker']}: {e}")
+                continue
+
+            status = _order_status(order)
+            filled_qty = _to_float(getattr(order, "filled_qty", None))
+            filled_avg_price = _to_float(getattr(order, "filled_avg_price", None))
+            self.db.update_trade_fill(
+                row["id"], status=status, filled_qty=filled_qty, filled_avg_price=filled_avg_price
+            )
+
+            slippage = None
+            if filled_avg_price is not None and row.get("price"):
+                # Signed against the direction of the trade: positive means the
+                # fill was worse than the price the decision was made at.
+                ref = float(row["price"])
+                slippage = filled_avg_price - ref if row["side"] == "BUY" else ref - filled_avg_price
+
+            change = {
+                "trade_id": row["id"], "ticker": row["ticker"], "side": row["side"],
+                "status": status, "filled_qty": filled_qty,
+                "filled_avg_price": filled_avg_price, "reference_price": row.get("price"),
+                "slippage": slippage,
+            }
+            changes.append(change)
+            print(
+                f"Reconciled {row['ticker']} {row['side']} order {row['order_id']}: "
+                f"{status}, filled {filled_qty} @ {filled_avg_price}"
+                + (f" (slippage {slippage:+.4f})" if slippage is not None else "")
+            )
+
+            # A non-terminal order older than a couple of trading days is not
+            # patiently waiting; something is wrong and it should be visible.
+            if status.lower() not in self.db.TERMINAL_ORDER_STATUSES:
+                age_days = (datetime.now() - datetime.fromisoformat(row["timestamp"])).days
+                if age_days >= 2:
+                    print(
+                        f"WARNING: order {row['order_id']} ({row['ticker']} {row['side']}) "
+                        f"still '{status}' after {age_days} days"
+                    )
+
+        return changes
+
+    def _read_account_state(self):
+        """(portfolio_value, cash, positions, positions_market_value, held_count)."""
+        account = with_retry(self.trading_client.get_account, description="get_account")
+        raw_positions = with_retry(
+            self.trading_client.get_all_positions, description="get_all_positions"
+        )
+        positions = {}
+        market_value = 0.0
+        for pos in raw_positions:
+            qty = _to_float(getattr(pos, "qty", None))
+            if qty is None or qty == 0:
+                continue
+            positions[pos.symbol] = qty
+            market_value += _to_float(getattr(pos, "market_value", None)) or 0.0
+        return (
+            _to_float(account.portfolio_value),
+            _to_float(account.cash),
+            positions,
+            market_value,
+            len(positions),
+        )
+
+    def log_portfolio_snapshot(self):
+        """
+        Record one account-level snapshot (portfolio value, cash, all positions).
+
+        Deliberately NOT called from run(). A snapshot describes the whole
+        account, not one ticker, so calling it per-ticker in a batch wrote ten
+        near-identical rows per trading day — inflating the table tenfold and
+        making "daily" returns actually intra-run returns. Callers own the
+        cadence: the scheduler snapshots once after its ticker loop, and the
+        single-run API endpoint snapshots once after its one run.
+
+        The reading is reconciled before it is persisted. On 2026-07-07 Alpaca
+        returned portfolio_value == cash with an empty position list, sampled at
+        16:30 ET before positions were marked, between two days that held six
+        positions worth ~$105k. That row was written verbatim and produced a
+        61% drawdown in every metric computed off the live curve, against an
+        actual return of +1.65%. An equity curve is only worth what its worst
+        point is worth, so a point that does not add up is not recorded.
+        """
+        value, cash, positions, market_value, held = self._read_account_state()
+
+        ok, reason, detail = reconcile_snapshot(value, cash, market_value, held)
+
+        # A mid-mark reading is transient: the positions are there, they just
+        # have not been marked yet. One re-read a moment later resolves it, and
+        # is much cheaper than losing the day's snapshot.
+        if not ok or reason == EMPTY_POSITIONS_VALUE_IS_CASH:
+            print(f"Snapshot did not reconcile ({reason}); re-reading account...")
+            time.sleep(SNAPSHOT_RETRY_DELAY_SECONDS)
+            value, cash, positions, market_value, held = self._read_account_state()
+            ok, reason, detail = reconcile_snapshot(value, cash, market_value, held)
+
+        if not ok:
+            # Refusing to write is the right failure here. A missing day leaves
+            # a gap in a curve that is already sparse and handled; a wrong day
+            # silently corrupts every metric derived from it.
+            print(f"REFUSING to record snapshot: {reason} {detail}")
+            self._log_execution_event(
+                ticker="ACCOUNT",
+                signal="N/A",
+                action="NO_SNAPSHOT",
+                reason=reason,
+                details=detail,
+            )
+            return None
+
+        if reason == EMPTY_POSITIONS_VALUE_IS_CASH:
+            # Still flat after the re-read, so the account really is flat and
+            # value == cash is the correct description of it. Logged because
+            # the same shape is what the defect produces, and a reader
+            # comparing against the previous row deserves to know which it was.
+            self._log_execution_event(
+                ticker="ACCOUNT",
+                signal="N/A",
+                action="SNAPSHOT_FLAT",
+                reason=reason,
+                details=detail,
+            )
+
+        self.db.log_portfolio_snapshot(
+            strategy=self.strategy.name,
+            portfolio_value=value,
+            cash=cash,
+            positions=positions,
+            data_quality=reason,
+        )
+        return reason
+
     def run(self):
-        """Run strategy and execute trades."""
+        """Run strategy and execute trades. Does not snapshot; see log_portfolio_snapshot."""
         print("="*60)
         if self._is_stat_arb():
             self._run_pair()
         else:
             self._run_single()
         print("="*60)
-        account = self.trading_client.get_account()
-        positions = {pos.symbol: float(pos.qty) for pos in self.trading_client.get_all_positions()}
-        self.db.log_portfolio_snapshot(
-            strategy=self.strategy.name,
-            portfolio_value=float(account.portfolio_value),
-            cash=float(account.cash),
-            positions=positions
-        )
 
     def _run_single(self):
         """Single-ticker flow (Momentum / MA Crossover)."""
@@ -535,6 +813,170 @@ class StrategyExecutor:
         current_signal = signals.iloc[-1]
         print(f"Latest signal: {current_signal}")
         self.execute_signal(current_signal, data)
+
+    def _pair_leg_order_id(self, pair_name, ticker, side, tag):
+        """
+        Deterministic id for one leg, so a retried submit cannot double it.
+
+        Includes the leg's role (tag) because a single state flip submits up to
+        four orders on the same pair, same day - closing one spread and opening
+        the other - and they must not collide with each other.
+        """
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
+        slug = self.strategy.name.replace(" ", "")
+        return f"{slug}-{pair_name}-{stamp}-{tag}-{ticker}-{side}"
+
+    def _assert_tradable(self, ticker, side):
+        """
+        Refuse a leg the broker will reject anyway.
+
+        A short leg needs the asset to be shortable and borrowable. Finding
+        that out from a rejection after the long leg is already filled is how
+        a naked position happens; asking first costs one request.
+
+        An unreadable asset record does not block the trade - that would make
+        a metadata outage a trading halt - but it is logged.
+        """
+        try:
+            asset = with_retry(
+                lambda: self.trading_client.get_asset(ticker),
+                description=f"get_asset({ticker})",
+            )
+        except Exception as e:
+            print(f"Could not verify {ticker} tradability ({e}); proceeding")
+            return True, None
+
+        if not getattr(asset, "tradable", True):
+            return False, f"{ticker} is not tradable"
+        if side == OrderSide.SELL:
+            if not getattr(asset, "shortable", True):
+                return False, f"{ticker} is not shortable"
+            if not getattr(asset, "easy_to_borrow", True):
+                print(f"Warning: {ticker} is shortable but not easy to borrow")
+        return True, None
+
+    def _submit_pair_legs(self, pair_name, leg_a, leg_b, tag):
+        """
+        Submit both legs of a spread, or neither.
+
+        Each leg is (ticker, qty, side). Returns (order_a, order_b).
+
+        The problem this exists for: the two legs were submitted sequentially
+        with no error handling, and log_pair_trade ran only after both
+        succeeded. If leg B was rejected - not shortable, hard to borrow,
+        insufficient margin, a 429, a transient 5xx - the exception propagated
+        to the scheduler's blanket except, got logged as "Failed TICKER", and
+        the loop moved on. The account was then holding an unhedged directional
+        position that no database row recorded. A pair strategy carrying one
+        leg is not a hedged trade with a problem; it is a naked bet nobody
+        chose to make.
+
+        So: pre-check both legs, record the intent before submitting anything,
+        and if leg B fails after leg A filled, unwind leg A immediately rather
+        than leaving it. The unwind is best-effort - if it also fails there is
+        nothing further this process can do, and the loudest possible record is
+        the remaining useful act.
+        """
+        ticker_a, qty_a, side_a = leg_a
+        ticker_b, qty_b, side_b = leg_b
+
+        for ticker, side in ((ticker_a, side_a), (ticker_b, side_b)):
+            ok, why = self._assert_tradable(ticker, side)
+            if not ok:
+                self._log_execution_event(
+                    ticker=pair_name, signal="N/A", action="NO_TRADE",
+                    reason="leg_not_tradable", details={"detail": why, "tag": tag},
+                )
+                raise RuntimeError(f"Pair {pair_name} not executable: {why}")
+
+        # Intent first. If the process dies between the two submits, this row is
+        # what tells the next run that a leg may be outstanding.
+        self._log_execution_event(
+            ticker=pair_name, signal="N/A", action="PAIR_INTENT", reason=tag,
+            details={
+                "ticker_a": ticker_a, "qty_a": qty_a, "side_a": side_a.value,
+                "ticker_b": ticker_b, "qty_b": qty_b, "side_b": side_b.value,
+            },
+        )
+
+        order_a = with_retry(
+            lambda: self.trading_client.submit_order(MarketOrderRequest(
+                symbol=ticker_a, qty=qty_a, side=side_a,
+                time_in_force=TimeInForce.DAY,
+                client_order_id=self._pair_leg_order_id(pair_name, ticker_a, side_a.value, tag),
+            )),
+            description=f"submit_order({side_a.value} {ticker_a}) leg A of {pair_name}",
+        )
+
+        try:
+            order_b = with_retry(
+                lambda: self.trading_client.submit_order(MarketOrderRequest(
+                    symbol=ticker_b, qty=qty_b, side=side_b,
+                    time_in_force=TimeInForce.DAY,
+                    client_order_id=self._pair_leg_order_id(pair_name, ticker_b, side_b.value, tag),
+                )),
+                description=f"submit_order({side_b.value} {ticker_b}) leg B of {pair_name}",
+            )
+        except Exception as leg_b_error:
+            self._unwind_leg(pair_name, ticker_a, qty_a, side_a, order_a, tag, leg_b_error)
+            raise
+
+        return order_a, order_b
+
+    def _unwind_leg(self, pair_name, ticker, qty, side, order, tag, cause):
+        """
+        Undo a leg whose partner could not be placed. Best effort, loudly logged.
+
+        Cancel first: if leg A has not filled yet - likely, since these are DAY
+        orders submitted after the close - cancelling is clean and costs
+        nothing. If it has filled, submit the opposite side to flatten.
+        """
+        print(f"LEG B FAILED on {pair_name} ({cause}); unwinding leg A ({side.value} {qty} {ticker})")
+        opposite = OrderSide.BUY if side == OrderSide.SELL else OrderSide.SELL
+        cancelled = False
+        unwound = False
+        unwind_error = None
+
+        try:
+            self.trading_client.cancel_order_by_id(order.id)
+            cancelled = True
+        except Exception as e:
+            cancelled = False
+            print(f"Could not cancel leg A ({e}); will try to flatten instead")
+
+        if not cancelled:
+            try:
+                with_retry(
+                    lambda: self.trading_client.submit_order(MarketOrderRequest(
+                        symbol=ticker, qty=qty, side=opposite,
+                        time_in_force=TimeInForce.DAY,
+                        client_order_id=self._pair_leg_order_id(
+                            pair_name, ticker, opposite.value, f"{tag}-unwind"
+                        ),
+                    )),
+                    description=f"unwind {opposite.value} {ticker}",
+                )
+                unwound = True
+            except Exception as e:
+                unwind_error = str(e)
+                print(f"UNWIND FAILED for {ticker}: {e}. POSITION MAY BE NAKED - intervene manually.")
+
+        self._log_execution_event(
+            ticker=pair_name, signal="N/A", action="PAIR_LEG_FAILED",
+            reason="leg_b_rejected",
+            details={
+                "tag": tag,
+                "leg_a_ticker": ticker,
+                "leg_a_qty": qty,
+                "leg_a_side": side.value,
+                "leg_a_order_id": str(getattr(order, "id", None)),
+                "cause": str(cause),
+                "leg_a_cancelled": cancelled,
+                "leg_a_flattened": unwound,
+                "unwind_error": unwind_error,
+                "naked_position_possible": not (cancelled or unwound),
+            },
+        )
 
     def _run_pair(self):
         """Pair flow (Stat Arb): fetch both, generate signals, execute both legs."""
@@ -570,3 +1012,4 @@ if __name__ == "__main__":
     strategy = MomentumStrategy()
     executor = StrategyExecutor(strategy, ticker='AAPL')
     executor.run()
+    executor.log_portfolio_snapshot()

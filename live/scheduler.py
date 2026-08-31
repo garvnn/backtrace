@@ -1,9 +1,9 @@
 """
 Daily strategy executor - runs at market close (4:30 PM ET) on weekdays.
 
-Runs one strategy per ticker (Momentum or MA Crossover) on top 10 SPY tickers. The strategy
-is chosen per ticker by profit probability from a short lookback backtest. Stat Arb is not
-run live; it remains available for backtesting only.
+Runs Momentum on each of the top 10 SPY tickers. Stat Arb is not run live; it remains
+available for backtesting only. See run_daily_strategy for why there is no longer a
+per-ticker strategy choice.
 Logs to scheduler.log and console. Errors for one ticker do not stop the rest.
 
 Usage:
@@ -43,9 +43,6 @@ TOP_10_SPY = [
     "XOM",
 ]
 
-# Lookback days for strategy selector backtest (Momentum vs MA)
-SELECTOR_LOOKBACK_DAYS = 60
-
 # Logging: file + console
 LOG_FILE = os.path.join(LIVE_DIR, "scheduler.log")
 _logger = None
@@ -68,16 +65,70 @@ def _get_logger():
     return logger
 
 
+def _calendar_probe(strategy_cls, executor_cls):
+    """
+    A trading client to ask about the calendar, before any ticker work starts.
+
+    Constructing an executor is how this module gets an authenticated client;
+    the ticker it is given is irrelevant to a calendar lookup.
+    """
+    return executor_cls(strategy_cls(), ticker=TOP_10_SPY[0]).trading_client
+
+
 def run_daily_strategy():
-    """Run one strategy per ticker (Momentum or MA Crossover) chosen by profit probability. Stat Arb is not run live."""
+    """
+    Run Momentum on every ticker in the universe. Stat Arb is not run live.
+
+    Previously this asked strategy_selector.select_strategy_for_ticker to pick
+    Momentum vs MA Crossover per ticker. That selector could not work: it fit on
+    a 60-bar window split 70/30, giving 42 training rows, while Momentum needs a
+    120-bar lookback and MA Crossover a 200-bar one. Both therefore produced
+    all-zero signals, both profit probabilities came out exactly 0.00, the
+    tie-break compared 0.0 to 0.0, and Momentum won by default - every ticker,
+    every day. Production confirms it: 1,144 snapshots across 115 trading days
+    are all tagged Momentum, and every log line reads
+    "train prob M=0.00 MA=0.00; val prob M=0.00 MA=0.00".
+
+    Removed rather than repaired. A meta-selector is a real idea, but it needs
+    enough history to fit on and an out-of-sample test that can fail; adding one
+    back is a deliberate piece of work, not a bug fix. Running one strategy
+    honestly beats advertising a choice that never happened.
+    """
     from strategies.momentum import MomentumStrategy
-    from strategies.mean_reversion import MeanReversionStrategy
-    from executor import StrategyExecutor, SessionBudget
-    from strategy_selector import select_strategy_for_ticker
-    from trading_constants import BUYING_POWER_FRACTION
+    from executor import StrategyExecutor
+    from market_calendar import UNKNOWN, describe_session
+    from trading.sizing import SessionBudget
+    from trading_constants import CAPITAL_FRACTION
 
     log = _get_logger()
     log.info("Daily BackTrace job started")
+
+    # Is today actually a session? The cron is Mon-Fri, which includes
+    # Thanksgiving, July 4th and Christmas. On those days the run used to
+    # proceed normally - stale bars, a signal off them, orders queued to the
+    # next real session - and was saved from placing duplicates only by the
+    # idempotency check, which is a different mechanism doing this one's job.
+    #
+    # An unreadable calendar does not stop the run. Refusing to trade because a
+    # metadata endpoint is down would be its own failure; it is logged as
+    # unknown and recorded on the run.
+    session = None
+    try:
+        session = describe_session(_calendar_probe(MomentumStrategy, StrategyExecutor))
+        if session["status"] == "closed":
+            log.info("Market closed today (%s) - no trading, no snapshot", session["date"])
+            log.info("Daily BackTrace job finished")
+            return
+        if session["status"] == UNKNOWN:
+            log.warning("Could not read market calendar (%s); proceeding", session.get("error"))
+        else:
+            log.info(
+                "Session %s open %s close %s%s",
+                session["date"], session.get("session_open"), session.get("session_close"),
+                " (half day)" if session.get("is_half_day") else "",
+            )
+    except Exception as cal_err:
+        log.warning("Market calendar check failed (%s); proceeding", cal_err)
 
     # Shared across every ticker in this run: caps total new-BUY dollars at
     # actual account cash, not the (possibly margin-leveraged) buying_power
@@ -85,49 +136,46 @@ def run_daily_strategy():
     # first ticker that gets far enough to have a live trading_client.
     session_budget = None
 
+    # Kept so the run can take exactly one account-level snapshot at the end.
+    last_executor = None
+
+    # Settle the PREVIOUS run's orders before placing new ones. A DAY market
+    # order submitted at 16:30 fills at the next open, ~17 hours later, so there
+    # is nothing to poll at submit time - each run reconciles the last one.
+    try:
+        reconciler = StrategyExecutor(MomentumStrategy(), ticker=TOP_10_SPY[0])
+        changes = reconciler.reconcile_open_orders()
+        if changes:
+            filled = [c for c in changes if (c["status"] or "").lower() == "filled"]
+            log.info("Reconciled %d open order(s); %d now filled", len(changes), len(filled))
+            for c in filled:
+                if c["slippage"] is not None:
+                    log.info(
+                        "  %s %s: ref %.4f -> fill %.4f (slippage %+.4f)",
+                        c["ticker"], c["side"], float(c["reference_price"]),
+                        c["filled_avg_price"], c["slippage"],
+                    )
+        else:
+            log.info("No open orders to reconcile")
+    except Exception as recon_err:
+        log.error("Order reconciliation failed (continuing to trade): %s", recon_err)
+
     for ticker in TOP_10_SPY:
         try:
-            # Get data via executor (same source as live signals)
-            executor = StrategyExecutor(MomentumStrategy(), ticker=ticker)
-            data = executor.get_historical_data(days=SELECTOR_LOOKBACK_DAYS)
-            if data is None or (hasattr(data, "empty") and data.empty) or len(data) < 30:
-                log.warning("Skipping %s: insufficient data", ticker)
-                continue
-
-            (
-                winner_class,
-                prob_mom_tr,
-                prob_ma_tr,
-                prob_mom_val,
-                prob_ma_val,
-            ) = select_strategy_for_ticker(ticker, data, lookback_days=SELECTOR_LOOKBACK_DAYS)
-            winner_name = winner_class().name
-            log.info(
-                "Chosen strategy for %s: %s (train prob M=%.2f MA=%.2f; val prob M=%.2f MA=%.2f)",
-                ticker,
-                winner_name,
-                prob_mom_tr,
-                prob_ma_tr,
-                prob_mom_val,
-                prob_ma_val,
-            )
-
             if session_budget is None:
+                probe = StrategyExecutor(MomentumStrategy(), ticker=ticker)
                 try:
-                    cash = float(executor.trading_client.get_account().cash)
-                    session_budget = SessionBudget(cash * BUYING_POWER_FRACTION)
+                    cash = float(probe.trading_client.get_account().cash)
+                    session_budget = SessionBudget(cash * CAPITAL_FRACTION)
                     log.info("Session capital budget for this run: $%.2f (from account cash $%.2f)", session_budget.remaining, cash)
                 except Exception as budget_err:
                     log.warning("Could not determine account cash for session budget cap; proceeding without a batch-level cap: %s", budget_err)
 
-            # Run executor with winning strategy
-            strategy = winner_class()
-            if isinstance(strategy, MeanReversionStrategy):
-                params = {"short_window": strategy.short_window, "long_window": strategy.long_window}
-            else:
-                params = {"lookback_period": strategy.lookback_period}
+            strategy = MomentumStrategy()
+            params = {"lookback_period": strategy.lookback_period}
             executor = StrategyExecutor(strategy, ticker=ticker, params=params, session_budget=session_budget)
             executor.run()
+            last_executor = executor
             log.info("Completed %s on %s", strategy.name, ticker)
         except Exception as e:
             log.error(
@@ -136,6 +184,19 @@ def run_daily_strategy():
                 e,
                 traceback.format_exc(),
             )
+
+    # One snapshot for the whole run, after every ticker has been processed.
+    # A snapshot is account-level state, so taking it inside executor.run() wrote
+    # one row per ticker - ten near-identical rows per trading day, which made
+    # the equity curve's "daily" returns actually intra-run returns.
+    if last_executor is not None:
+        try:
+            last_executor.log_portfolio_snapshot()
+            log.info("Recorded end-of-run portfolio snapshot")
+        except Exception as snap_err:
+            log.error("Failed to record end-of-run snapshot: %s", snap_err)
+    else:
+        log.warning("No ticker completed; no snapshot recorded")
 
     log.info("Daily BackTrace job finished")
 
@@ -151,6 +212,7 @@ def run_test_job():
         strategy = MomentumStrategy()
         executor = StrategyExecutor(strategy, ticker="AAPL")
         executor.run()
+        executor.log_portfolio_snapshot()
         log.info("Test job completed successfully")
     except Exception as e:
         log.error("Test job failed: %s\n%s", e, traceback.format_exc())

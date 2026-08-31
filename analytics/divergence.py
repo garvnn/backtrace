@@ -44,14 +44,15 @@ def load_backtest_equity_series(result_row: dict) -> pd.Series:
 
 
 def _strategy_aliases(name: str) -> set[str]:
-    """Backtests store MeanReversion; live executor logs MA Crossover."""
-    s = (name or "").strip()
-    aliases = {s}
-    if s == "MeanReversion":
-        aliases.add("MA Crossover")
-    if s == "MA Crossover":
-        aliases.add("MeanReversion")
-    return aliases
+    """
+    Every spelling a stored row might use for this strategy.
+
+    Live trades are keyed "MA Crossover"; backtest rows written before the
+    rename are keyed "MeanReversion". Matching one and not the other silently
+    drops half the history being compared.
+    """
+    from strategies.naming import storage_aliases
+    return {(name or "").strip(), *storage_aliases(name)}
 
 
 def load_live_equity_series(
@@ -196,11 +197,12 @@ def build_strategy_for_divergence(
     exit_threshold: float = 0.5,
 ):
     """Mirror live/api._build_strategy without importing api (avoid circular imports)."""
-    from strategies.mean_reversion import MeanReversionStrategy
+    from strategies.ma_crossover import MACrossoverStrategy
     from strategies.momentum import MomentumStrategy
+    from strategies.naming import MA_CROSSOVER, STAT_ARB, canonical
     from strategies.stat_arb import StatArbStrategy
 
-    if strategy_name == "Stat Arb" and ticker_a and ticker_b:
+    if canonical(strategy_name) == STAT_ARB and ticker_a and ticker_b:
         return StatArbStrategy(
             ticker_a=ticker_a,
             ticker_b=ticker_b,
@@ -208,8 +210,8 @@ def build_strategy_for_divergence(
             entry_threshold=entry_threshold,
             exit_threshold=exit_threshold,
         )
-    if strategy_name in ("MeanReversion", "MA Crossover"):
-        return MeanReversionStrategy(short_window=short_window, long_window=long_window)
+    if canonical(strategy_name) == MA_CROSSOVER:
+        return MACrossoverStrategy(short_window=short_window, long_window=long_window)
     return MomentumStrategy(lookback_period=lookback_period)
 
 
@@ -223,7 +225,7 @@ def _run_same_bar_close_fill(data: pd.DataFrame, strategy, engine_params: dict) 
     cash = float(engine_params.get("initial_capital", INITIAL_CAPITAL))
     commission = float(engine_params.get("commission", DEFAULT_COMMISSION))
     max_dollar = float(engine_params.get("max_dollar_per_stock", engine_params.get("max_dollar", 10_000)))
-    bp = float(engine_params.get("buying_power_fraction", 0.95))
+    bp = float(engine_params.get("capital_fraction", 0.95))
     shares = 0
 
     for i in range(len(data)):
@@ -284,7 +286,7 @@ def estimate_execution_timing_impact(
             "initial_capital": engine.initial_capital,
             "commission": engine.commission,
             "max_dollar_per_stock": engine.max_dollar_per_stock,
-            "buying_power_fraction": engine.buying_power_fraction,
+            "capital_fraction": engine.capital_fraction,
         },
     )
     return {

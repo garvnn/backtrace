@@ -12,13 +12,13 @@ sys.path.insert(0, LIVE_DIR)
 import logging
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from database import Database
 
 logger = logging.getLogger(__name__)
-from pairs_config import get_available_pairs, is_valid_pair
+from pairs_config import get_available_pairs, get_pair_details, is_valid_pair, validated_pairs
 import json
 from datetime import datetime, timezone, timedelta, date
 import pandas as pd
@@ -27,14 +27,57 @@ load_dotenv(os.path.join(LIVE_DIR, ".env"))
 
 app = FastAPI()
 
-# Enable CORS for frontend
+# CORS. Set ALLOWED_ORIGINS to a comma-separated list of your frontend origins
+# in production, e.g. "https://backtrace.vercel.app". Defaults to "*" so local
+# development and the existing deployment keep working.
+#
+# allow_credentials is False whenever origins is "*": that combination is
+# invalid per the CORS spec and browsers reject the response, so the previous
+# allow_origins=["*"] with allow_credentials=True was not doing what it looked
+# like it was doing.
+_origins_env = os.getenv("ALLOWED_ORIGINS", "").strip()
+ALLOWED_ORIGINS = [o.strip() for o in _origins_env.split(",") if o.strip()] or ["*"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=ALLOWED_ORIGINS != ["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Write-side authentication.
+#
+# Two endpoints change state outside this process: POST /run-executor submits
+# real orders to Alpaca, and DELETE /trades/{id} destroys audit records. Both
+# were reachable by anyone who knew the URL, on a service the README tells you
+# to deploy publicly.
+#
+# Default-deny: unless BACKTRACE_API_KEY is set in the environment, they return
+# 503 and do nothing. When it is set, callers must send a matching X-API-Key.
+# Read-only GETs stay open so the dashboard keeps working unchanged.
+#
+# Note this intentionally disables the dashboard's "Run Strategy" button in a
+# public deployment. A browser button cannot hold a secret - shipping the key in
+# the frontend bundle would publish it - so an unauthenticated public button
+# that places brokerage orders cannot be made safe while staying a public
+# button. The scheduler places the real trades on its own; manual runs are a
+# convenience, available via curl with the key or by running locally.
+API_KEY = os.getenv("BACKTRACE_API_KEY", "").strip()
+
+
+def require_write_auth(x_api_key: str = Header(default=None, alias="X-API-Key")):
+    """Gate for endpoints that place orders or delete records."""
+    if not API_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Write endpoints are disabled. Set BACKTRACE_API_KEY in the server "
+                "environment to enable them, then send it as the X-API-Key header."
+            ),
+        )
+    if not x_api_key or x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Missing or invalid X-API-Key header.")
+    return True
 
 DB_PATH = os.getenv("DB_PATH") or os.path.join(LIVE_DIR, "trading.db")
 db = Database(DB_PATH)
@@ -199,9 +242,22 @@ def get_execution_logs(strategy: str = None, ticker: str = None, limit: int = 20
 
 @app.get("/available-pairs/{ticker}")
 def get_pairs_for_ticker(ticker: str):
-    """Get list of valid pairs for a ticker."""
-    pairs = get_available_pairs(ticker.upper())
-    return {"ticker": ticker.upper(), "available_pairs": pairs}
+    """
+    Valid pair options for a ticker, with the evidence behind them.
+
+    available_pairs keeps its original shape (a list of symbols) so existing
+    callers are unaffected. details carries the cointegration p-value for each,
+    and universe says whether these were tested at all or are the untested
+    sector fallback - the config used to claim "pre-validated" for pairs that
+    had never been tested.
+    """
+    sym = ticker.upper()
+    return {
+        "ticker": sym,
+        "available_pairs": get_available_pairs(sym),
+        "details": get_pair_details(sym),
+        "universe": validated_pairs(),
+    }
 
 
 @app.get("/pairs")
@@ -242,8 +298,8 @@ def get_pair_trades(strategy: str = None):
 
 
 @app.delete("/trades/{trade_id}")
-def delete_trade(trade_id: int):
-    """Delete a trade by id."""
+def delete_trade(trade_id: int, _auth: bool = Depends(require_write_auth)):
+    """Delete a trade by id. Requires X-API-Key; destroys an audit record."""
     if not db.delete_trade(trade_id):
         raise HTTPException(status_code=404, detail="Trade not found")
     return {"ok": True}
@@ -370,6 +426,9 @@ def get_daily_bars(ticker: str, time_range: str = "1Y"):
 
 
 from trading_constants import INITIAL_CAPITAL
+from engine.fingerprint import backtest_fingerprint
+from strategies.naming import canonical as strategy_canonical, storage_aliases
+from snapshot_health import clean_series
 
 
 def _compute_spy_benchmark(start_date: str, end_date: str, initial_capital: float):
@@ -381,13 +440,12 @@ def _compute_spy_benchmark(start_date: str, end_date: str, initial_capital: floa
     try:
         os.chdir(PROJECT_ROOT)
         from data.loader import load_data
-        from engine.backtest_engine import BacktestEngine
         from analytics.benchmark import equity_series_to_curve_list, metrics_from_equity_series
 
         spy_df = load_data("SPY", start_date, end_date)
         if spy_df is None or len(spy_df) == 0:
             return None
-        engine = BacktestEngine(initial_capital=initial_capital)
+        engine = _benchmark_engine(initial_capital)
         spy_results = engine.run_buyhold(spy_df)
         spy_pv = spy_results["portfolio_values"]
         m = metrics_from_equity_series(spy_pv, initial_capital)
@@ -407,9 +465,33 @@ def _compute_spy_benchmark(start_date: str, end_date: str, initial_capital: floa
         os.chdir(old)
 
 
+def _benchmark_engine(initial_capital: float):
+    """
+    Engine configured for an index benchmark: deploy the whole account.
+
+    The strategy engine caps each position at MAX_DOLLAR_PER_STOCK and holds back
+    1 - CAPITAL_FRACTION in cash. Those are risk limits on a strategy, not
+    properties of "what if I had just bought the index," but run_buyhold read the
+    same settings - so the SPY benchmark was buying $10,000 of SPY and leaving
+    $90,000 in cash. That reported SPY at roughly +36% over a stretch where it
+    actually returned several hundred percent, and made the strategy look
+    competitive with an index it was not competing with.
+
+    A strategy that leaves most of its capital idle SHOULD underperform a fully
+    invested index. That gap is a real result, so the benchmark deploys fully.
+    """
+    from engine.backtest_engine import BacktestEngine
+
+    return BacktestEngine(
+        initial_capital=initial_capital,
+        max_dollar_per_stock=float("inf"),
+        capital_fraction=1.0,
+    )
+
+
 def _spy_payload_for_live_window(start_date: str, end_inclusive: str):
     """
-    SPY buy-and-hold for the live-benchmark window.
+    SPY buy-and-hold over exactly [start_date, end_inclusive].
     end_inclusive is the last calendar day (inclusive); yfinance end is exclusive.
     """
     end_exclusive = (date.fromisoformat(end_inclusive) + timedelta(days=1)).isoformat()
@@ -417,13 +499,12 @@ def _spy_payload_for_live_window(start_date: str, end_inclusive: str):
     try:
         os.chdir(PROJECT_ROOT)
         from data.loader import load_data
-        from engine.backtest_engine import BacktestEngine
         from analytics.benchmark import equity_series_to_curve_list, metrics_from_equity_series
 
         spy_df = load_data("SPY", start_date, end_exclusive)
         if spy_df is None or len(spy_df) == 0:
             return None
-        engine = BacktestEngine(initial_capital=INITIAL_CAPITAL)
+        engine = _benchmark_engine(INITIAL_CAPITAL)
         spy_results = engine.run_buyhold(spy_df)
         spy_pv = spy_results["portfolio_values"]
         sm = metrics_from_equity_series(spy_pv, INITIAL_CAPITAL)
@@ -442,28 +523,142 @@ def _spy_payload_for_live_window(start_date: str, end_inclusive: str):
 
 @app.get("/performance")
 def get_performance(strategy: str = None):
-    """Get performance metrics. Total return is always from original 100k capital."""
-    history = db.get_portfolio_history(strategy=strategy)
-    initial_value = INITIAL_CAPITAL
-    current_value = history[-1][3] if history else initial_value
-    total_return = (current_value - initial_value) / initial_value
+    """
+    Performance over the recorded window.
 
+    total_return is measured from the FIRST recorded snapshot, not from the
+    configured INITIAL_CAPITAL. Those differ: snapshotting began after trading
+    had already started, so the first recorded value was ~103.6k rather than
+    100k, and measuring against the constant silently credited the strategy with
+    gains from before the record exists.
+
+    configured_initial_capital and return_vs_configured_capital keep the old
+    number available, clearly labelled as what it is.
+    """
+    history = db.get_portfolio_history(strategy=strategy)
     trades = db.get_all_trades(strategy=strategy)
 
+    if not history:
+        return {
+            "total_return": 0.0,
+            "num_trades": len(trades),
+            "current_value": INITIAL_CAPITAL,
+            "initial_value": INITIAL_CAPITAL,
+            "configured_initial_capital": INITIAL_CAPITAL,
+            "return_vs_configured_capital": 0.0,
+            "first_snapshot": None,
+            "last_snapshot": None,
+            "snapshot_days": 0,
+        }
+
+    first_value = float(history[0][3])
+    current_value = float(history[-1][3])
+    baseline = first_value if first_value > 0 else INITIAL_CAPITAL
+
     return {
-        "total_return": total_return,
+        "total_return": (current_value - baseline) / baseline,
         "num_trades": len(trades),
         "current_value": current_value,
-        "initial_value": initial_value,
+        "initial_value": first_value,
+        "configured_initial_capital": INITIAL_CAPITAL,
+        "return_vs_configured_capital": (current_value - INITIAL_CAPITAL) / INITIAL_CAPITAL,
+        "first_snapshot": history[0][1],
+        "last_snapshot": history[-1][1],
+        "snapshot_days": len({(row[1] or "")[:10] for row in history if row[1]}),
     }
 
 
 def _normalize_strategy_for_db(strategy: str) -> str:
-    """Saved backtests use MeanReversion; UI may send MA Crossover."""
-    s = (strategy or "Momentum").strip()
-    if s == "MA Crossover":
-        return "MeanReversion"
-    return s
+    """
+    Canonical strategy name for a request.
+
+    Kept as a thin wrapper so the endpoints read the same as before; the
+    mapping itself now lives in strategies/naming.py rather than being
+    reimplemented at each call site. Reads should query with
+    naming.storage_aliases() so pre-rename "MeanReversion" rows stay visible.
+    """
+    return strategy_canonical(strategy)
+
+
+def _describe_backtest(row: dict) -> dict:
+    """Enough of a saved run to tell two of them apart in an error message."""
+    return {
+        "id": row.get("id"),
+        "created_at": row.get("created_at"),
+        "code_fingerprint": row.get("code_fingerprint"),
+        "total_return": row.get("total_return"),
+        "num_trades": row.get("num_trades"),
+        "start_date": row.get("start_date"),
+        "end_date": row.get("end_date"),
+    }
+
+
+def _select_backtest(results: list, backtest_id: Optional[int], ticker: str, strat_db: str):
+    """
+    Pick which saved backtest the live curve is compared against.
+
+    This used to be results[0] - whichever row happened to sort first. The
+    production database holds 27 runs of Momentum/AAPL over the same window
+    reporting three different total returns (+29.65% and +3.84%, all at n=49),
+    because the sizing code changed between them and nothing recorded which
+    version produced which row. An arbitrary row was therefore setting the
+    magnitude of the project's headline number.
+
+    Now: an explicit backtest_id always wins (the caller said which one), but
+    the response reports whether that run's code fingerprint still matches the
+    engine running now. Without an explicit id, only runs produced by the
+    current code are eligible, newest first; if none are, the endpoint refuses
+    and names the stale candidates rather than quietly comparing against code
+    that no longer exists.
+    """
+    current_fp = backtest_fingerprint()
+
+    if backtest_id is not None:
+        for r in results:
+            if r.get("id") == backtest_id:
+                return r, {
+                    "backtest_id_used": r.get("id"),
+                    "selected_by": "explicit_backtest_id",
+                    "current_code_fingerprint": current_fp,
+                    "backtest_code_fingerprint": r.get("code_fingerprint"),
+                    "code_fingerprint_match": r.get("code_fingerprint") == current_fp,
+                }
+        raise HTTPException(
+            status_code=422,
+            detail=f"backtest_id={backtest_id} not found for ticker={ticker} strategy={strat_db}",
+        )
+
+    matching = [r for r in results if r.get("code_fingerprint") == current_fp]
+    if not matching:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "no_comparable_backtest",
+                "message": (
+                    f"None of the {len(results)} saved backtest(s) for ticker={ticker} "
+                    f"strategy={strat_db} were produced by the current engine code "
+                    f"(fingerprint {current_fp}). Comparing live results against a run from "
+                    "different code attributes the gap to the strategy when it belongs to a "
+                    "code change. Re-run POST /backtest, or pass an explicit backtest_id to "
+                    "override."
+                ),
+                "current_code_fingerprint": current_fp,
+                "rejected_candidates": [_describe_backtest(r) for r in results[:10]],
+            },
+        )
+
+    chosen = matching[0]  # get_backtest_results orders by id DESC
+    return chosen, {
+        "backtest_id_used": chosen.get("id"),
+        "selected_by": "newest_matching_code_fingerprint",
+        "current_code_fingerprint": current_fp,
+        "backtest_code_fingerprint": chosen.get("code_fingerprint"),
+        "code_fingerprint_match": True,
+        "candidates_matching_code": len(matching),
+        "candidates_rejected_stale_code": [
+            _describe_backtest(r) for r in results if r.get("code_fingerprint") != current_fp
+        ][:10],
+    }
 
 
 @app.get("/divergence-analysis")
@@ -492,25 +687,13 @@ def get_divergence_analysis(
     if not ticker:
         raise HTTPException(status_code=400, detail="ticker is required")
     strat_db = _normalize_strategy_for_db(strategy)
-    results = db.get_backtest_results(ticker=ticker, strategy=strat_db)
+    results = db.get_backtest_results(ticker=ticker, strategy=storage_aliases(strat_db))
     if not results:
         raise HTTPException(
             status_code=422,
             detail=f"No backtest results for ticker={ticker} strategy={strat_db}. Run POST /backtest first.",
         )
-    row = None
-    if backtest_id is not None:
-        for r in results:
-            if r.get("id") == backtest_id:
-                row = r
-                break
-        if row is None:
-            raise HTTPException(
-                status_code=422,
-                detail=f"backtest_id={backtest_id} not found for ticker={ticker} strategy={strat_db}",
-            )
-    else:
-        row = results[0]
+    row, selection = _select_backtest(results, backtest_id, ticker, strat_db)
 
     history = db.get_portfolio_history(strategy=None)
     report = build_full_report(
@@ -532,6 +715,7 @@ def get_divergence_analysis(
     report["strategy_query"] = strategy
     report["strategy_normalized"] = strat_db
     report["backtest_id"] = row.get("id")
+    report["backtest_selection"] = selection
     return report
 
 
@@ -553,13 +737,15 @@ def _build_strategy(strategy_name: str, short_window: int, long_window: int, loo
                     ticker_a: str = None, ticker_b: str = None, lookback: int = 60,
                     entry_threshold: float = 2.0, exit_threshold: float = 0.5):
     from strategies.momentum import MomentumStrategy
-    from strategies.mean_reversion import MeanReversionStrategy
+    from strategies.ma_crossover import MACrossoverStrategy
     from strategies.stat_arb import StatArbStrategy
-    if strategy_name == "Stat Arb" and ticker_a and ticker_b:
+    from strategies.naming import MA_CROSSOVER, STAT_ARB
+    name = strategy_canonical(strategy_name)
+    if name == STAT_ARB and ticker_a and ticker_b:
         return StatArbStrategy(ticker_a=ticker_a, ticker_b=ticker_b, lookback=lookback,
                                entry_threshold=entry_threshold, exit_threshold=exit_threshold)
-    if strategy_name == "MeanReversion" or strategy_name == "MA Crossover":
-        return MeanReversionStrategy(short_window=short_window, long_window=long_window)
+    if name == MA_CROSSOVER:
+        return MACrossoverStrategy(short_window=short_window, long_window=long_window)
     return MomentumStrategy(lookback_period=lookback_period)
 
 
@@ -571,9 +757,8 @@ def run_backtest(req: BacktestRequest):
         raise HTTPException(status_code=400, detail="ticker is required")
     start_date = req.start_date
     end_date = req.end_date
-    strategy_name = req.strategy or "Momentum"
-    if strategy_name == "MA Crossover":
-        strategy_name = "MeanReversion"
+    # Canonical from here down: this is what gets written to backtest_results.
+    strategy_name = strategy_canonical(req.strategy)
     is_stat_arb = strategy_name == "Stat Arb"
     if is_stat_arb:
         ticker_b = (req.ticker_b or "").strip().upper()
@@ -608,11 +793,21 @@ def run_backtest(req: BacktestRequest):
             results = engine.run_pair(data_a, data_b, strategy)
             metrics = calculate_metrics(results)
             benchmark = _compute_spy_benchmark(start_date, end_date, engine.initial_capital)
-            db.save_backtest_results(
+            pair_params = {
+                "strategy": strategy_name,
+                "ticker_a": ticker,
+                "ticker_b": ticker_b,
+                "lookback": int(req.lookback) if req.lookback is not None else 60,
+                "entry_threshold": float(req.entry_threshold) if req.entry_threshold is not None else 2.0,
+                "exit_threshold": float(req.exit_threshold) if req.exit_threshold is not None else 0.5,
+            }
+            saved_id = db.save_backtest_results(
                 strategy_name, pair_ticker, start_date, end_date,
                 float(metrics["total_return"]), float(metrics["sharpe_ratio"]),
                 float(metrics["max_drawdown"]), int(metrics["num_trades"]),
                 results["portfolio_values"],
+                params=pair_params,
+                code_fingerprint=backtest_fingerprint(),
             )
             # Return the run we just computed (do not re-fetch from DB) so client always gets fresh result
             pv = results["portfolio_values"]
@@ -621,6 +816,8 @@ def run_backtest(req: BacktestRequest):
                 for i in range(len(pv))
             ]
             result = {
+                "id": saved_id,
+                "code_fingerprint": backtest_fingerprint(),
                 "ticker": pair_ticker,
                 "strategy": strategy_name,
                 "start_date": start_date,
@@ -656,19 +853,28 @@ def run_backtest(req: BacktestRequest):
         b = _compute_spy_benchmark(start_date, end_date, engine.initial_capital)
         if b:
             response_enrichment["benchmark"] = b
-        db.save_backtest_results(
+        saved_id = db.save_backtest_results(
             strategy_name, ticker, start_date, end_date,
             float(metrics["total_return"]), float(metrics["sharpe_ratio"]),
             float(metrics["max_drawdown"]), int(metrics["num_trades"]),
             results["portfolio_values"],
+            params={
+                "strategy": strategy_name,
+                "short_window": req.short_window,
+                "long_window": req.long_window,
+                "lookback_period": req.lookback_period,
+            },
+            code_fingerprint=backtest_fingerprint(),
         )
+        response_enrichment["id"] = saved_id
+        response_enrichment["code_fingerprint"] = backtest_fingerprint()
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         os.chdir(old_cwd)
-    saved = db.get_backtest_results(ticker=ticker, strategy=strategy_name)
+    saved = db.get_backtest_results(ticker=ticker, strategy=storage_aliases(strategy_name))
     result = dict(saved[0]) if saved else {}
     result["equity_curve"] = _downsample_equity_curve(result.get("equity_curve") or [])
     result["params_used"] = {
@@ -695,8 +901,27 @@ def get_live_benchmark(strategy: str = None, time_range: str = "1Y"):
         pv = float(snap[3])
         d = (ts_raw or "")[:10]
         if d and start_date <= d <= end_inclusive:
-            points.append({"timestamp": d, "portfolio_value": pv})
+            positions_raw = snap[5] if len(snap) > 5 else None
+            try:
+                positions = json.loads(positions_raw) if positions_raw else {}
+            except (TypeError, json.JSONDecodeError):
+                positions = {}
+            points.append({
+                "timestamp": d,
+                "portfolio_value": pv,
+                "cash": float(snap[4]) if snap[4] is not None else 0.0,
+                "positions": positions,
+            })
     points.sort(key=lambda x: x["timestamp"])
+
+    # Drop readings that do not describe a state the account can be in before
+    # any metric is computed off them. On 2026-07-07 Alpaca returned
+    # portfolio_value == cash with no positions, sampled mid-mark at the close
+    # between two days holding ~$105k; that single row put a 61% max drawdown
+    # on a curve whose actual return is +1.65%. Excluded, not deleted - the row
+    # stays in the table as evidence about the feed, and the response reports
+    # how many were dropped so the number is never silently massaged.
+    points, excluded_points = clean_series(points)
     trades = db.get_all_trades(strategy=strategy)
     num_trades = len(trades)
 
@@ -722,6 +947,11 @@ def get_live_benchmark(strategy: str = None, time_range: str = "1Y"):
                 "no_history": True,
             },
             "spy": spy_payload,
+            "data_quality": {
+                "snapshots_used": 0,
+                "snapshots_excluded": len(excluded_points),
+                "excluded": excluded_points[:20],
+            },
         }
 
     try:
@@ -736,13 +966,21 @@ def get_live_benchmark(strategy: str = None, time_range: str = "1Y"):
         ]
         live_curve = _downsample_equity_curve(live_curve_full)
 
-        spy_payload = _spy_payload_for_live_window(start_date, end_inclusive)
+        # SPY spans exactly the live data, not the requested calendar window.
+        # time_range only selects WHICH snapshots to include; the benchmark must
+        # cover the same days those snapshots cover. Previously SPY used the raw
+        # window, so time_range=ALL (12 years) benchmarked 115 days of live
+        # trading against 12 years of SPY.
+        spy_start, spy_end = ts_list[0], ts_list[-1]
+        spy_payload = _spy_payload_for_live_window(spy_start, spy_end)
 
         lm = metrics_from_sparse_equity_points(ts_list, scaled_vals, INITIAL_CAPITAL)
         return {
-            "start_date": start_date,
-            "end_date": end_inclusive,
+            "start_date": spy_start,
+            "end_date": spy_end,
             "time_range": time_range,
+            "requested_window": {"start": start_date, "end": end_inclusive},
+            "aligned_to_live_data": True,
             "live_equity_curve": live_curve,
             "spy_equity_curve": spy_payload["equity_curve"] if spy_payload else [],
             "live": {
@@ -754,6 +992,11 @@ def get_live_benchmark(strategy: str = None, time_range: str = "1Y"):
                 "avg_return_per_trade": None,
             },
             "spy": spy_payload,
+            "data_quality": {
+                "snapshots_used": len(points),
+                "snapshots_excluded": len(excluded_points),
+                "excluded": excluded_points[:20],
+            },
         }
     except Exception as e:
         logger.exception("live-benchmark failed: %s", e)
@@ -763,7 +1006,9 @@ def get_live_benchmark(strategy: str = None, time_range: str = "1Y"):
 @app.get("/backtest-results")
 def get_backtest_results(ticker: str = None, strategy: str = None):
     """Get saved backtest results, optionally filtered by ticker and/or strategy. Equity curves are downsampled."""
-    results = db.get_backtest_results(ticker=ticker, strategy=strategy)
+    results = db.get_backtest_results(
+        ticker=ticker, strategy=storage_aliases(strategy) if strategy else None
+    )
     for r in results:
         r["equity_curve"] = _downsample_equity_curve(r.get("equity_curve") or [])
     return {"results": results}
@@ -777,8 +1022,9 @@ def get_monte_carlo(ticker: str, strategy: str = "Momentum", runs: int = 10000):
     """
     from analytics.monte_carlo import run_monte_carlo
 
-    normalized_strategy = "MeanReversion" if strategy == "MA Crossover" else strategy
-    results = db.get_backtest_results(ticker=ticker.strip().upper(), strategy=normalized_strategy)
+    results = db.get_backtest_results(
+        ticker=ticker.strip().upper(), strategy=storage_aliases(strategy)
+    )
 
     if not results:
         return {"error": "No backtest results found. Run backtest first."}
@@ -817,13 +1063,11 @@ class RunExecutorRequest(BaseModel):
 
 
 @app.post("/run-executor")
-def run_executor(req: RunExecutorRequest = None):
-    """Run the strategy executor once (paper trade) with selected strategy and params."""
+def run_executor(req: RunExecutorRequest = None, _auth: bool = Depends(require_write_auth)):
+    """Run the strategy executor once (paper trade). Requires X-API-Key; submits real orders."""
     req = req or RunExecutorRequest()
     ticker = (req.ticker or "AAPL").strip().upper()
-    strategy_name = req.strategy or "Momentum"
-    if strategy_name == "MA Crossover":
-        strategy_name = "MeanReversion"
+    strategy_name = strategy_canonical(req.strategy)
     ticker_a = ticker
     ticker_b = None
     if strategy_name == "Stat Arb":
@@ -853,6 +1097,9 @@ def run_executor(req: RunExecutorRequest = None):
             params = {"lookback": req.lookback, "entry_threshold": req.entry_threshold, "exit_threshold": req.exit_threshold}
         executor = StrategyExecutor(strategy, ticker=ticker_a, params=params)
         executor.run()
+        # run() no longer snapshots; a single manual run is its own "run", so it
+        # takes exactly one snapshot here (see StrategyExecutor.log_portfolio_snapshot).
+        executor.log_portfolio_snapshot()
         out = {
             "ok": True,
             "message": "Strategy run complete. Check portfolio and trades.",

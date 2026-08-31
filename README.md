@@ -4,7 +4,9 @@ Compares backtested trading strategies against live paper trading execution to m
 
 ## Overview
 
-BackTrace runs the same strategies in two modes: **backtesting** on historical data and **live paper trading** via Alpaca. A dashboard and API support side-by-side comparison of backtest vs live results, Monte Carlo simulation for robustness, and automated daily execution across multiple tickers and strategies.
+BackTrace runs the same strategy in two modes: **backtesting** on historical data (Yahoo) and **live paper trading** via Alpaca, then measures the gap between them. A dashboard and API support side-by-side comparison, Monte Carlo robustness testing, and automated daily execution across a ten-name universe.
+
+The two vendors are deliberate. Backtesting on Yahoo and trading on Alpaca is what makes the vendor component of the backtest/live gap measurable at all — `analytics/divergence.py` pulls Alpaca bars specifically to quantify it against Yahoo's. The cost is a symbol-mapping layer (`data/symbols.py`), since the two disagree on how to spell a class share.
 
 **Tech stack:** Python (backtest engine), FastAPI (API), SQLite (state), React + Recharts (dashboard), Alpaca API (paper trading), APScheduler (daily runs).
 
@@ -19,21 +21,130 @@ BackTrace runs the same strategies in two modes: **backtesting** on historical d
 
 1. **Momentum** — 6-month lookback: long when 6-month return is positive, otherwise flat/cash.
 2. **MA Crossover** — 50/200-day moving average crossover: long when 50-day MA is above 200-day MA.
-3. **Statistical Arbitrage** — Pairs trading on configured equity pairs (e.g. AAPL/MSFT, GOOGL/META) using spread mean reversion.
+3. **Statistical Arbitrage** — Pairs trading on configured equity pairs (e.g. AAPL/MSFT, GOOGL/META) using spread mean reversion. Backtest only.
+
+Only Momentum runs live. The other two are available to backtest.
+
+Note on naming: the MA Crossover strategy is trend-following (long while the fast MA is above
+the slow one), not mean-reverting. It previously lived in `mean_reversion.py` as
+`MeanReversionStrategy`, which is why backtest rows saved before the rename are keyed
+`MeanReversion`; `strategies/naming.py` maps the spellings in one place.
 
 ## Results
 
-*(To be updated with actual data.)*
+### The live track record
 
-After [X] weeks of live trading ([Y] trades):
+Paper trading has run unattended on Railway since March 2026. As of **2026-08-25**:
 
-| Strategy       | Backtest | Live    | Difference |
-|----------------|----------|---------|------------|
-| Momentum       | +X.XX%   | +Y.YY%  | ±Z.ZZ%     |
-| MA Crossover   | +X.XX%   | +Y.YY%  | ±Z.ZZ%     |
-| Stat Arb       | +X.XX%   | +Y.YY%  | ±Z.ZZ%     |
+| | |
+|---|---|
+| Trading days | 115 (2026-03-17 → 2026-08-25, no gaps) |
+| Account snapshots | 1,144 |
+| Orders submitted | 45 |
+| Universe | 10 largest SPY holdings |
+| Strategy | Momentum (120-day lookback), long/flat |
+| Live return | **+1.68%** (103,621.03 → 105,366.19) |
 
-**Analysis:** *(Objective explanation of observed differences once data is available.)*
+The return is measured from the **first snapshot**, not from the configured $100,000 starting
+capital. Those differ — the account had already drifted before the first snapshot was written —
+and measuring against the configured number instead reported +5.37%, which is a real
++1.68% plus $3,621 of history that predates the record. `/performance` and `/live-benchmark`
+now agree to eight decimal places because both measure the same window.
+
+### The divergence figure
+
+**Not yet reported.** The attribution machinery exists (`analytics/divergence.py`, with
+confidence intervals from the block bootstrap in `analytics/robustness.py`), and the live equity
+curve above is trustworthy — it is Alpaca's own account value, so it reflects whatever actually
+filled. What is missing is *per-trade* attribution: all 45 orders were recorded at submission
+and never polled again, so the trades table holds decision-time reference prices, not fills.
+Reconciliation now runs at the start of each daily job, so trades from here forward carry a
+terminal status and a real `filled_avg_price`; the 45 historical ones cannot be recovered.
+
+The intended output, once enough reconciled trades accumulate:
+
+```
+Over N trading days, M reconciled trades, 10-name universe:
+Momentum (120d) returned +A.A% live vs +B.B% backtested — a gap of −C.C% ± D.D%
+
+Attribution:
+  −x.x%   execution timing (T+1 open fills vs. same-bar close)
+  −x.x%   transaction cost
+  −x.x%   data vendor (Alpaca IEX vs. Yahoo consolidated closes)
+  −x.x%   unexplained
+```
+
+No backtest number is quoted here yet, deliberately. The database holds 27 saved runs of
+Momentum on AAPL over the same window reporting three different answers (+29.65% and +3.84%,
+all at 49 trades) because the sizing code changed between them and nothing recorded which
+version produced which row. Saved runs now carry a fingerprint of the code that produced them
+and results from different code are no longer comparable; the number will be quoted once a run
+under the current engine exists.
+
+## Known gaps
+
+Tracked honestly rather than described as working.
+
+Open:
+
+- `live/api.py` calls `os.chdir()` in five endpoints so relative imports resolve. That is
+  process-global, so concurrent requests can corrupt each other's working directory. The real
+  fix is a package with a `pyproject.toml`.
+- Stat Arb's pair universe defaults to hand-picked sector groupings until `pairs_finder.py` is
+  run. `GET /available-pairs/{ticker}` reports which universe is active, so this is visible
+  rather than implied, but the tested set is not checked in.
+
+Closed recently:
+
+- ~~`pairs_config.py` claimed its pairs were "pre-validated"~~ — they were hand-picked by
+  sector and never tested, while `pairs_finder.py` ran a real Engle-Granger cointegration test
+  that nothing imported. The two are now connected: `pairs_output.json` is the universe when it
+  exists, p-values travel with each pair, and the sector list is retained as a fallback that
+  says outright it is untested.
+- ~~A rejected pair leg could leave a naked position~~ — the two legs were submitted
+  sequentially with no error handling, and the trade was recorded only after both succeeded, so
+  a rejection on the second left an unhedged directional position that no row described. Legs
+  are now pre-checked for tradability and shortability, the intent is written before anything is
+  submitted, and a failure on the second leg cancels the first (or flattens it if already
+  filled). If even the unwind fails, the log says `naked_position_possible` rather than going
+  quiet. Legs also carry `client_order_id` now, which is what makes retrying them safe.
+- ~~Live and backtest sized positions separately~~ — one `SizingPolicy` in `trading/sizing.py`
+  now serves both, and a parity test asserts they return identical share counts across a
+  capital × price grid. The executor reads `account.cash` for single names and `account.equity`
+  for pair legs, never `buying_power` — the margin allowance it used to size against, which is
+  what drove production cash to −$6,830.22 on 2026-07-10. Measured before the fix: identical at
+  $100k capital where the $10k cap binds, but 31 shares vs 63 at $5k, and 2.11× on pair legs.
+- ~~No market-hours or holiday gating~~ — `get_calendar()` gates the daily job, so it no longer
+  runs on Thanksgiving or July 4th, and half-days are detected and logged. An unreadable
+  calendar is reported as unknown and the run proceeds; treating a metadata outage as a holiday
+  would silently skip a real session.
+- ~~No retry or rate-limit handling~~ — `live/alpaca_retry.py` wraps every Alpaca call with
+  exponential backoff and jitter on 429/5xx, and does not retry other 4xx. Order submission is
+  retried only because each order carries a deterministic `client_order_id` that the broker
+  rejects on duplicate; the pair legs, which have none, are deliberately excluded.
+- ~~Market data feed was never specified~~ — `feed=` is now explicit and defaults to IEX, which
+  is what the free plan serves. Set `ALPACA_DATA_FEED=sip` with a paid subscription. This
+  matters because the Alpaca-vs-Yahoo close divergence the project measures is partly a
+  consequence of IEX being a few percent of consolidated volume; leaving the feed to a server
+  default meant the measurement had an unstated variable in it.
+- ~~Orders are never polled~~ — `reconcile_open_orders` settles the previous run's orders at the
+  start of the next one, recording terminal status, `filled_qty`, `filled_avg_price` and signed
+  slippage. A DAY market order submitted at 16:30 fills at the next open ~17 hours later, so
+  there is nothing to poll at submit time.
+- ~~The API is unauthenticated~~ — `POST /run-executor` and `DELETE /trades/{id}` require
+  `X-API-Key` and default to denying when `BACKTRACE_API_KEY` is unset. CORS origins are
+  configurable rather than `*`.
+- ~~A 61% drawdown on the live curve~~ — diagnosed, and it was a data-quality defect, not a
+  strategy result. On 2026-07-07 at 16:30 ET, the minute the scheduler fires, Alpaca returned
+  `portfolio_value == cash` with an empty position list, between two days holding six positions
+  worth ~$105k. That single row was written verbatim and set the max drawdown for the entire
+  curve. Snapshots are now reconciled against the marked value of what is held before being
+  persisted, with one retry for the transient case; readings that do not add up are refused and
+  logged rather than recorded. Historical rows are excluded from metrics by shape rather than
+  deleted, and `/live-benchmark` reports how many it dropped.
+- ~~Per-ticker strategy selection~~ — advertised but never functioned: it fit on 42 training
+  rows while the strategies need 120 and 200, so both scored exactly 0.00 and Momentum won the
+  tie every time, for every ticker, across all 115 days. Removed rather than papered over.
 
 ## What This Demonstrates
 
@@ -45,7 +156,7 @@ After [X] weeks of live trading ([Y] trades):
 
 - **Backend:** FastAPI, SQLite (positions and run history), Alpaca API for paper orders and market data.
 - **Frontend:** React, Recharts for equity curves and comparison charts.
-- **Automation:** APScheduler triggers a daily job at 4:30 PM ET (after US market close); the job runs Momentum and MA Crossover on the top 10 SPY tickers and Stat Arb on configured pairs, then places orders for next-day execution.
+- **Automation:** APScheduler triggers a daily job at 4:30 PM ET (after US market close); the job runs Momentum on the top 10 SPY tickers, then places DAY market orders that queue to the next open. Stat Arb and MA Crossover are backtest-only — the scheduler does not run them live.
 - **Features:** Monte Carlo simulation (API endpoint), multi-ticker and multi-strategy runs, backtest engine with configurable transaction costs.
 
 ## Project Structure
@@ -84,14 +195,19 @@ cd frontend && npm install && cd ..
 
 1. **Backtest only (no live trading):**
    ```bash
-   python visualization/plots.py
    python strategies/momentum.py
-   python strategies/mean_reversion.py
+   python strategies/ma_crossover.py
    python analytics/metrics.py
    ```
 
 2. **Live module (API + dashboard):**
    - Create `live/.env` with `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` (paper keys from [Alpaca](https://app.alpaca.markets/paper/dashboard/apis)).
+   - Optional: `BACKTRACE_API_KEY` enables the write endpoints (`POST /run-executor`,
+     `DELETE /trades/{id}`), which are otherwise disabled. Callers send it as `X-API-Key`.
+     Leave it unset in a public deployment — a browser button cannot hold a secret, so the
+     dashboard's "Run Strategy" button is deliberately inert there. The scheduler places the
+     real trades on its own.
+   - Optional: `ALLOWED_ORIGINS`, a comma-separated list of frontend origins. Defaults to `*`.
    - From project root:
      ```bash
      cd live && uvicorn api:app --reload

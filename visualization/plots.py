@@ -47,7 +47,7 @@ if __name__ == "__main__":
     from data.loader import load_data
     from engine.backtest_engine import BacktestEngine
     from strategies.momentum import MomentumStrategy
-    from strategies.mean_reversion import MeanReversionStrategy
+    from strategies.ma_crossover import MACrossoverStrategy
     
     print("Testing visualization...")
     
@@ -57,7 +57,7 @@ if __name__ == "__main__":
     # Run all strategies
     results = {
         'Buy & Hold': engine.run_buyhold(data),
-        'MA Crossover': engine.run(data, MeanReversionStrategy()),
+        'MA Crossover': engine.run(data, MACrossoverStrategy()),
         'Momentum': engine.run(data, MomentumStrategy())
     }
     

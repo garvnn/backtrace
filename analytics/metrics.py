@@ -65,13 +65,13 @@ def calculate_metrics(results):
 if __name__ == "__main__":
     from data.loader import load_data
     from engine.backtest_engine import BacktestEngine
-    from strategies.mean_reversion import MeanReversionStrategy
+    from strategies.ma_crossover import MACrossoverStrategy
     
     print("Testing metrics...")
     
     data = load_data('AAPL', '2020-01-01', '2024-12-31')
     engine = BacktestEngine()
-    strategy = MeanReversionStrategy()
+    strategy = MACrossoverStrategy()
     
     results = engine.run(data, strategy)
     metrics = calculate_metrics(results)

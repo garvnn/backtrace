@@ -12,6 +12,8 @@ import pandas as pd
 import yfinance as yf
 from statsmodels.tsa.stattools import coint
 
+from data.symbols import to_alpaca, to_yahoo
+
 # Allow running from project root or live/
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
@@ -33,8 +35,11 @@ TOP_N = 5
 
 def download_prices(symbols, start_date, end_date):
     """Download daily close prices for all symbols; return DataFrame with aligned index."""
+    # Yahoo spells class shares with a hyphen where Alpaca uses a dot. The
+    # current universe has none, but this file now feeds pairs_config, so a
+    # symbol added later must not silently return an empty frame.
     df = yf.download(
-        symbols,
+        [to_yahoo(s) for s in symbols],
         start=start_date,
         end=end_date,
         progress=False,
@@ -49,17 +54,22 @@ def download_prices(symbols, start_date, end_date):
         close_col = "Close" if "Close" in df.columns else "Adj Close"
         out = pd.DataFrame({symbols[0]: df[close_col]})
         return out
-    # Multi-index: (Ticker, OHLC) -> extract Close per symbol
+    # Multi-index: (Ticker, OHLC) -> extract Close per symbol.
+    #
+    # Columns come back spelled the way Yahoo was asked, so look up by the
+    # Yahoo form and key the result by the canonical (Alpaca) one - callers,
+    # and pairs_output.json, speak canonical.
     closes = {}
     for sym in symbols:
+        yahoo_sym = to_yahoo(sym)
         try:
-            if (sym, "Close") in df.columns:
-                closes[sym] = df[(sym, "Close")].copy()
-            elif (sym, "Adj Close") in df.columns:
-                closes[sym] = df[(sym, "Adj Close")].copy()
+            if (yahoo_sym, "Close") in df.columns:
+                closes[sym] = df[(yahoo_sym, "Close")].copy()
+            elif (yahoo_sym, "Adj Close") in df.columns:
+                closes[sym] = df[(yahoo_sym, "Adj Close")].copy()
             else:
                 # level 0 = ticker, level 1 = OHLC
-                sub = df[sym] if sym in df.columns.get_level_values(0) else None
+                sub = df[yahoo_sym] if yahoo_sym in df.columns.get_level_values(0) else None
                 if sub is not None and "Close" in sub.columns:
                     closes[sym] = sub["Close"].copy()
         except (KeyError, TypeError):
